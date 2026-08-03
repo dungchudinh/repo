@@ -117,7 +117,7 @@ export function startBot() {
         if (interval !== undefined) {
           clearInterval(interval);
           activeSpams.delete(mentionedUser.id);
-          await message.channel.send(`rớt sàn 😂 ${mentionedUser}`);
+          await message.channel.send(`còn gà lắm ${mentionedUser}`);
         } else {
           await message.reply(`Không có spam nào đang chạy cho ${mentionedUser}.`);
         }
@@ -131,7 +131,7 @@ export function startBot() {
           clearInterval(interval);
         }
         activeSpams.clear();
-        await message.channel.send("rớt sàn 😂");
+        await message.channel.send("còn gà lắm 😂");
       }
     }
   });
