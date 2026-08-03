@@ -16,6 +16,20 @@ export function startBot() {
     ],
   });
 
+  // Map<targetUserId, intervalId> — tracks all active spam loops
+  const activeSpams = new Map<string, ReturnType<typeof setInterval>>();
+
+  /** Check role permission: user must be server owner OR have a role higher than the bot. */
+  function hasPermission(guild: import("discord.js").Guild, member: import("discord.js").GuildMember, authorId: string) {
+    const me = guild.members.me;
+    if (!me) return false;
+    const isServerOwner = authorId === guild.ownerId;
+    return (
+      isServerOwner ||
+      member.roles.highest.position > me.roles.highest.position
+    );
+  }
+
   client.on("ready", () => {
     logger.info({ tag: client.user?.tag }, "Discord bot is online");
   });
@@ -23,34 +37,26 @@ export function startBot() {
   client.on("messageCreate", async (message) => {
     if (message.author.bot) return;
 
-    if (message.content.startsWith("!spam")) {
-      // 1. Kiểm tra xem có đang nhắn trong Server không
+    const content = message.content.trim();
+
+    // ── !spam ──────────────────────────────────────────────────────────────
+    if (content.startsWith("!spam") && !content.startsWith("!unspam")) {
       if (!message.guild) {
         await message.reply("Lệnh này chỉ có thể sử dụng trong Server!");
         return;
       }
 
       const member = message.member;
-      const me = message.guild.members.me;
+      if (!member) return;
 
-      if (!member || !me) return;
-
-      const userHighestRole = member.roles.highest;
-      const botHighestRole = me.roles.highest;
-
-      // 2. Kiểm tra nếu Role người dùng thấp hơn hoặc bằng Role của Bot (và không phải Chủ Server)
-      const isServerOwner = message.author.id === message.guild.ownerId;
-
-      if (userHighestRole.position <= botHighestRole.position && !isServerOwner) {
+      if (!hasPermission(message.guild, member, message.author.id)) {
         await message.reply(
           "❌ Bạn phải có Role nằm cao hơn Role của Bot mới được dùng lệnh!",
         );
         return;
       }
 
-      // 3. Đủ điều kiện — chạy lệnh spam
       const mentionedUser = message.mentions.users.first();
-
       if (!mentionedUser) {
         await message.reply(
           "Vui lòng @tag một người dùng! Cú pháp: `!spam @user`",
@@ -58,14 +64,21 @@ export function startBot() {
         return;
       }
 
-      await message.channel.send(
-        `Đã kích hoạt spam nhắc nhở ${mentionedUser}!`,
-      );
+      // Cancel any existing spam loop for this target before starting a new one
+      const existing = activeSpams.get(mentionedUser.id);
+      if (existing !== undefined) {
+        clearInterval(existing);
+        activeSpams.delete(mentionedUser.id);
+      }
+
+      await message.channel.send(`Đã kích hoạt spam nhắc nhở ${mentionedUser}!`);
 
       let count = 0;
       const interval = setInterval(() => {
-        if (count >= 50) {
+        // Stop if unspam was called or we hit 50 messages
+        if (!activeSpams.has(mentionedUser.id) || count >= 50) {
           clearInterval(interval);
+          activeSpams.delete(mentionedUser.id);
           return;
         }
         message.channel
@@ -75,6 +88,51 @@ export function startBot() {
           );
         count++;
       }, 2000);
+
+      activeSpams.set(mentionedUser.id, interval);
+    }
+
+    // ── !unspam ────────────────────────────────────────────────────────────
+    else if (content.startsWith("!unspam")) {
+      if (!message.guild) {
+        await message.reply("Lệnh này chỉ có thể sử dụng trong Server!");
+        return;
+      }
+
+      const member = message.member;
+      if (!member) return;
+
+      if (!hasPermission(message.guild, member, message.author.id)) {
+        await message.reply(
+          "❌ Bạn phải có Role nằm cao hơn Role của Bot mới được dùng lệnh!",
+        );
+        return;
+      }
+
+      const mentionedUser = message.mentions.users.first();
+
+      if (mentionedUser) {
+        // Cancel spam for a specific user
+        const interval = activeSpams.get(mentionedUser.id);
+        if (interval !== undefined) {
+          clearInterval(interval);
+          activeSpams.delete(mentionedUser.id);
+          await message.channel.send(`rớt sàn 😂 ${mentionedUser}`);
+        } else {
+          await message.reply(`Không có spam nào đang chạy cho ${mentionedUser}.`);
+        }
+      } else {
+        // No mention — cancel ALL active spams
+        if (activeSpams.size === 0) {
+          await message.reply("Không có spam nào đang chạy.");
+          return;
+        }
+        for (const [, interval] of activeSpams) {
+          clearInterval(interval);
+        }
+        activeSpams.clear();
+        await message.channel.send("rớt sàn 😂");
+      }
     }
   });
 
