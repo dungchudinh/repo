@@ -69,7 +69,7 @@ export function startBot() {
           return;
         }
         message.channel
-          .send(`Dậy đi ${mentionedUser} ơi!`)
+          .send(`con tuat chui vào bụng mẹ trốn à 😂 ${mentionedUser}`)
           .catch((err: unknown) =>
             logger.error({ err }, "Failed to send spam message"),
           );
