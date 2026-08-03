@@ -24,6 +24,31 @@ export function startBot() {
     if (message.author.bot) return;
 
     if (message.content.startsWith("!spam")) {
+      // 1. Kiểm tra xem có đang nhắn trong Server không
+      if (!message.guild) {
+        await message.reply("Lệnh này chỉ có thể sử dụng trong Server!");
+        return;
+      }
+
+      const member = message.member;
+      const me = message.guild.members.me;
+
+      if (!member || !me) return;
+
+      const userHighestRole = member.roles.highest;
+      const botHighestRole = me.roles.highest;
+
+      // 2. Kiểm tra nếu Role người dùng thấp hơn hoặc bằng Role của Bot (và không phải Chủ Server)
+      const isServerOwner = message.author.id === message.guild.ownerId;
+
+      if (userHighestRole.position <= botHighestRole.position && !isServerOwner) {
+        await message.reply(
+          "❌ Bạn phải có Role nằm cao hơn Role của Bot mới được dùng lệnh!",
+        );
+        return;
+      }
+
+      // 3. Đủ điều kiện — chạy lệnh spam
       const mentionedUser = message.mentions.users.first();
 
       if (!mentionedUser) {
