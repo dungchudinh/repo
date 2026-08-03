@@ -1,5 +1,6 @@
 import { Client, GatewayIntentBits } from "discord.js";
 import { logger } from "./lib/logger";
+import { getSpamMessage, setSpamMessage } from "./bot-config";
 
 export function startBot() {
   const token = process.env["DISCORD_TOKEN"];
@@ -20,7 +21,11 @@ export function startBot() {
   const activeSpams = new Map<string, ReturnType<typeof setInterval>>();
 
   /** Check role permission: user must be server owner OR have a role higher than the bot. */
-  function hasPermission(guild: import("discord.js").Guild, member: import("discord.js").GuildMember, authorId: string) {
+  function hasPermission(
+    guild: import("discord.js").Guild,
+    member: import("discord.js").GuildMember,
+    authorId: string,
+  ) {
     const me = guild.members.me;
     if (!me) return false;
     const isServerOwner = authorId === guild.ownerId;
@@ -82,7 +87,7 @@ export function startBot() {
           return;
         }
         message.channel
-          .send(`con tuat chui vào bụng mẹ trốn à 😂 ${mentionedUser}`)
+          .send(`${getSpamMessage()} ${mentionedUser}`)
           .catch((err: unknown) =>
             logger.error({ err }, "Failed to send spam message"),
           );
@@ -112,7 +117,6 @@ export function startBot() {
       const mentionedUser = message.mentions.users.first();
 
       if (mentionedUser) {
-        // Cancel spam for a specific user
         const interval = activeSpams.get(mentionedUser.id);
         if (interval !== undefined) {
           clearInterval(interval);
@@ -122,7 +126,6 @@ export function startBot() {
           await message.reply(`Không có spam nào đang chạy cho ${mentionedUser}.`);
         }
       } else {
-        // No mention — cancel ALL active spams
         if (activeSpams.size === 0) {
           await message.reply("Không có spam nào đang chạy.");
           return;
@@ -133,6 +136,37 @@ export function startBot() {
         activeSpams.clear();
         await message.channel.send("còn gà lắm 😂");
       }
+    }
+
+    // ── !caidat ────────────────────────────────────────────────────────────
+    else if (content.startsWith("!caidat")) {
+      if (!message.guild) {
+        await message.reply("Lệnh này chỉ có thể sử dụng trong Server!");
+        return;
+      }
+
+      const member = message.member;
+      if (!member) return;
+
+      if (!hasPermission(message.guild, member, message.author.id)) {
+        await message.reply(
+          "❌ Bạn phải có Role nằm cao hơn Role của Bot mới được dùng lệnh!",
+        );
+        return;
+      }
+
+      const newMessage = content.slice("!caidat".length).trim();
+      if (!newMessage) {
+        await message.reply(
+          `ℹ️ Nội dung spam hiện tại: \`${getSpamMessage()}\`\nCú pháp đổi: \`!caidat [nội dung mới]\``,
+        );
+        return;
+      }
+
+      setSpamMessage(newMessage);
+      await message.reply(
+        `✅ Đã cập nhật nội dung spam thành: \`${newMessage}\``,
+      );
     }
   });
 
