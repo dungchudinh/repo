@@ -64,7 +64,7 @@ export function startBot() {
 
       let count = 0;
       const interval = setInterval(() => {
-        if (count >= 5) {
+        if (count >= 50) {
           clearInterval(interval);
           return;
         }
