@@ -6,10 +6,12 @@ const CONFIG_PATH = join(process.cwd(), "bot-config.json");
 
 interface BotConfig {
   spamMessage: string;
+  spamCount: number;
 }
 
 const DEFAULT_CONFIG: BotConfig = {
   spamMessage: "con tuat chui vào bụng mẹ trốn à 😂",
+  spamCount: 50,
 };
 
 function loadConfig(): BotConfig {
@@ -41,5 +43,14 @@ export function getSpamMessage(): string {
 
 export function setSpamMessage(newMessage: string): void {
   config.spamMessage = newMessage;
+  saveConfig(config);
+}
+
+export function getSpamCount(): number {
+  return config.spamCount;
+}
+
+export function setSpamCount(count: number): void {
+  config.spamCount = count;
   saveConfig(config);
 }
