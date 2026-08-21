@@ -11,6 +11,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   AuditLogEvent,
+  EmbedBuilder,
 } from "discord.js";
 import { fileURLToPath } from "url";
 import path from "path";
@@ -20,10 +21,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "verify-state.json");
 const CONFIG_FILE = path.join(__dirname, "saved-configs.json");
 const ANTINUKE_FILE = path.join(__dirname, "antinuke-state.json");
+const HONEYPOT_FILE = path.join(__dirname, "honeypot-state.json");
 const VERIFY_ROLE_NAME = "verify";
 const VERIFY_CHANNEL_NAME = "verify";
 const VERIFY_EMOJI = "✅";
 const ANTINUKE_LOG_CHANNEL_NAME = "wxz-log";
+const HONEYPOT_CHANNEL_NAME = "honeypot";
+const MAX_MUTE_MINUTES = 40320; // 28 ngày — tối đa Discord cho phép
+
+const PROTECTED_CHANNEL_NAMES = new Set([ANTINUKE_LOG_CHANNEL_NAME, HONEYPOT_CHANNEL_NAME]);
+function isProtectedChannelName(name) {
+  return PROTECTED_CHANNEL_NAMES.has(name);
+}
 
 function loadJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return null; }
@@ -37,6 +46,8 @@ const loadConfigs = () => loadJSON(CONFIG_FILE) ?? {};
 const saveConfigs = (c) => saveJSON(CONFIG_FILE, c);
 const loadAntinuke = () => loadJSON(ANTINUKE_FILE);
 const saveAntinuke = (a) => saveJSON(ANTINUKE_FILE, a);
+const loadHoneypot = () => loadJSON(HONEYPOT_FILE);
+const saveHoneypot = (h) => saveJSON(HONEYPOT_FILE, h);
 
 const token = process.env["DISCORD_TOKEN"];
 if (!token) {
@@ -57,7 +68,6 @@ const client = new Client({
 
 let isRestoring = false;
 
-/** Kiểm tra quyền: user phải là chủ server HOẶC có role cao hơn bot. */
 function hasPermission(guild, member, authorId) {
   const me = guild.members.me;
   if (!me) return false;
@@ -70,29 +80,60 @@ function hasPermission(guild, member, authorId) {
 const slashCommands = [
   new SlashCommandBuilder()
     .setName("saveconfig")
-    .setDescription("Lưu cấu trúc server hiện tại (kênh, quyền, thứ tự...) để phục hồi sau này")
+    .setDescription("Lưu cấu trúc server hiện tại để phục hồi sau này")
     .addStringOption((opt) =>
       opt.setName("ten").setDescription("Đặt tên cho bản lưu này").setRequired(true),
     ),
   new SlashCommandBuilder()
     .setName("setconfig")
-    .setDescription("Phục hồi server theo cấu hình đã lưu — XOÁ hết kênh hiện tại")
+    .setDescription("Đồng bộ server theo cấu hình đã lưu — kênh giống thì giữ, khác thì xoá và tạo lại")
     .addStringOption((opt) =>
       opt.setName("ten").setDescription("Tên bản lưu muốn phục hồi").setRequired(true),
     ),
   new SlashCommandBuilder()
     .setName("antinuke")
-    .setDescription("Kích hoạt bẫy chống nuke: tạo kênh log, tự xử lý khi kênh đó bị xoá")
+    .setDescription("Kích hoạt bẫy chống nuke")
     .addStringOption((opt) =>
       opt.setName("hanhdong")
         .setDescription("Xử lý người xoá kênh log")
         .setRequired(true)
-        .addChoices({ name: "Kick", value: "kick" }, { name: "Ban", value: "ban" }),
+        .addChoices(
+          { name: "Kick", value: "kick" },
+          { name: "Ban", value: "ban" },
+          { name: "Mute (Timeout)", value: "mute" },
+        ),
     )
     .addStringOption((opt) =>
       opt.setName("config")
-        .setDescription("Tên bản cấu hình đã lưu (từ /saveconfig) để tự động khôi phục")
+        .setDescription("Tên bản cấu hình đã lưu để tự động khôi phục")
         .setRequired(true),
+    )
+    .addIntegerOption((opt) =>
+      opt.setName("thoigian")
+        .setDescription("Số phút mute — chỉ dùng khi chọn Mute (mặc định 40320 phút = 28 ngày)")
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(MAX_MUTE_MINUTES),
+    ),
+  new SlashCommandBuilder()
+    .setName("honeypotsetup")
+    .setDescription("Tạo kênh bẫy honeypot — ai nhắn tin vào sẽ bị xử lý tự động")
+    .addStringOption((opt) =>
+      opt.setName("hanhdong")
+        .setDescription("Xử lý người nhắn vào kênh bẫy")
+        .setRequired(true)
+        .addChoices(
+          { name: "Kick", value: "kick" },
+          { name: "Ban", value: "ban" },
+          { name: "Mute (Timeout)", value: "mute" },
+        ),
+    )
+    .addIntegerOption((opt) =>
+      opt.setName("thoigian")
+        .setDescription("Số phút mute — chỉ dùng khi chọn Mute (mặc định 40320 phút = 28 ngày)")
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(MAX_MUTE_MINUTES),
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -107,21 +148,32 @@ client.on("clientReady", async (readyClient) => {
   }
 });
 
-// ── Chụp lại toàn bộ cấu trúc server thành object ────────────────────────
+function normalizeOverwrites(channel) {
+  return [...channel.permissionOverwrites.cache.values()].map((ow) => ({
+    id: ow.id,
+    type: ow.type,
+    allow: ow.allow.bitfield.toString(),
+    deny: ow.deny.bitfield.toString(),
+  }));
+}
+
+function overwritesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  const byId = (x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
+  const sa = [...a].sort(byId);
+  const sb = [...b].sort(byId);
+  return sa.every((ow, i) => ow.id === sb[i].id && ow.type === sb[i].type && ow.allow === sb[i].allow && ow.deny === sb[i].deny);
+}
+
 function captureGuildConfig(guild) {
   const sorted = [...guild.channels.cache.values()]
-    .filter((c) => c.name !== ANTINUKE_LOG_CHANNEL_NAME) // không lưu kênh bẫy
+    .filter((c) => !isProtectedChannelName(c.name))
     .sort((a, b) => a.position - b.position);
   const categories = [];
   const channels = [];
 
   for (const channel of sorted) {
-    const overwrites = [...channel.permissionOverwrites.cache.values()].map((ow) => ({
-      id: ow.id, type: ow.type,
-      allow: ow.allow.bitfield.toString(),
-      deny: ow.deny.bitfield.toString(),
-    }));
-
+    const overwrites = normalizeOverwrites(channel);
     if (channel.type === ChannelType.GuildCategory) {
       categories.push({ name: channel.name, overwrites });
     } else {
@@ -148,263 +200,363 @@ function buildPermissionOptions(allowStr, denyStr) {
   return options;
 }
 
-// ── Xoá hết kênh hiện tại và dựng lại theo cấu hình đã lưu ──────────────
+const MAX_DELETE_RETRIES = 3;
+const MAX_CREATE_RETRIES = 3;
+const OP_DELAY_MS = 350;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function deleteChannelWithRetry(channel, log) {
+  for (let attempt = 1; attempt <= MAX_DELETE_RETRIES; attempt++) {
+    try {
+      await channel.delete("Đồng bộ cấu hình");
+      return true;
+    } catch (err) {
+      log.errors.push(`Xoá "${channel.name}" lỗi (lần ${attempt}): ${err.message}`);
+      if (attempt === MAX_DELETE_RETRIES) return false;
+      await sleep(OP_DELAY_MS * attempt);
+    }
+  }
+  return false;
+}
+
+async function createChannelWithRetry(guild, options, log) {
+  for (let attempt = 1; attempt <= MAX_CREATE_RETRIES; attempt++) {
+    try {
+      return await guild.channels.create(options);
+    } catch (err) {
+      log.errors.push(`Tạo "${options.name}" lỗi (lần ${attempt}): ${err.message}`);
+      if (attempt === MAX_CREATE_RETRIES) return null;
+      await sleep(OP_DELAY_MS * attempt);
+    }
+  }
+  return null;
+}
+
 async function restoreGuildConfig(guild, config) {
   isRestoring = true;
+  const log = { kept: 0, deleted: 0, created: 0, errors: [] };
   try {
-    const existing = [...guild.channels.cache.values()];
-    for (const channel of existing) {
-      await channel.delete("Restore config").catch(() => {});
-    }
-    if (config.guildName && config.guildName !== guild.name) {
-      await guild.setName(config.guildName).catch(() => {});
-    }
-    const categoryIdByName = new Map();
-    for (const cat of config.categories) {
-      const created = await guild.channels.create({ name: cat.name, type: ChannelType.GuildCategory });
-      categoryIdByName.set(cat.name, created.id);
-      for (const ow of cat.overwrites) {
-        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny)).catch(() => {});
+    const currentChannels = [...(await guild.channels.fetch()).values()]
+      .filter((c) => !isProtectedChannelName(c.name));
+    const currentCategories = currentChannels.filter((c) => c.type === ChannelType.GuildCategory);
+    const currentOthers = currentChannels.filter((c) => c.type !== ChannelType.GuildCategory);
+
+    const keptIds = new Set();
+
+    const usedCategoryIdx = new Set();
+    const keptCategoryByConfigName = new Map();
+    const categoriesToDelete = [];
+    for (const cat of currentCategories) {
+      let matched = -1;
+      for (let i = 0; i < config.categories.length; i++) {
+        if (usedCategoryIdx.has(i)) continue;
+        const cfg = config.categories[i];
+        if (cat.name === cfg.name && overwritesEqual(normalizeOverwrites(cat), cfg.overwrites)) {
+          matched = i;
+          break;
+        }
+      }
+      if (matched !== -1) {
+        usedCategoryIdx.add(matched);
+        keptCategoryByConfigName.set(config.categories[matched].name, cat);
+        keptIds.add(cat.id);
+        log.kept++;
+      } else {
+        categoriesToDelete.push(cat);
       }
     }
-    for (const ch of config.channels) {
-      const created = await guild.channels.create({
+
+    const usedChannelIdx = new Set();
+    const channelsToDelete = [];
+    for (const ch of currentOthers) {
+      const chParentName = ch.parent?.name ?? null;
+      const chTopic = "topic" in ch ? (ch.topic ?? null) : null;
+      let matched = -1;
+      for (let i = 0; i < config.channels.length; i++) {
+        if (usedChannelIdx.has(i)) continue;
+        const cfg = config.channels[i];
+        if (
+          ch.type === cfg.type &&
+          ch.name === cfg.name &&
+          chParentName === cfg.parentName &&
+          chTopic === (cfg.topic ?? null) &&
+          overwritesEqual(normalizeOverwrites(ch), cfg.overwrites)
+        ) {
+          matched = i;
+          break;
+        }
+      }
+      if (matched !== -1) {
+        usedChannelIdx.add(matched);
+        keptIds.add(ch.id);
+        log.kept++;
+      } else {
+        channelsToDelete.push(ch);
+      }
+    }
+
+    for (const channel of channelsToDelete) {
+      const ok = await deleteChannelWithRetry(channel, log);
+      if (ok) log.deleted++;
+      await sleep(OP_DELAY_MS);
+    }
+    for (const channel of categoriesToDelete) {
+      const ok = await deleteChannelWithRetry(channel, log);
+      if (ok) log.deleted++;
+      await sleep(OP_DELAY_MS);
+    }
+
+    if (config.guildName && config.guildName !== guild.name) {
+      await guild.setName(config.guildName).catch((err) => log.errors.push(`Đổi tên server lỗi: ${err.message}`));
+    }
+
+    const categoryIdByName = new Map();
+    for (const [name, ch] of keptCategoryByConfigName) categoryIdByName.set(name, ch.id);
+    for (let i = 0; i < config.categories.length; i++) {
+      if (usedCategoryIdx.has(i)) continue;
+      const cat = config.categories[i];
+      const created = await createChannelWithRetry(guild, { name: cat.name, type: ChannelType.GuildCategory }, log);
+      if (!created) continue;
+      log.created++;
+      keptIds.add(created.id);
+      categoryIdByName.set(cat.name, created.id);
+      for (const ow of cat.overwrites) {
+        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
+          .catch((err) => log.errors.push(`Set quyền danh mục "${cat.name}" lỗi: ${err.message}`));
+      }
+      await sleep(OP_DELAY_MS);
+    }
+
+    for (let i = 0; i < config.channels.length; i++) {
+      if (usedChannelIdx.has(i)) continue;
+      const ch = config.channels[i];
+      const created = await createChannelWithRetry(guild, {
         name: ch.name, type: ch.type,
         parent: ch.parentName ? categoryIdByName.get(ch.parentName) : undefined,
         topic: ch.topic ?? undefined,
-      });
+      }, log);
+      if (!created) continue;
+      log.created++;
+      keptIds.add(created.id);
       for (const ow of ch.overwrites) {
-        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny)).catch(() => {});
+        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
+          .catch((err) => log.errors.push(`Set quyền kênh "${ch.name}" lỗi: ${err.message}`));
+      }
+      await sleep(OP_DELAY_MS);
+    }
+
+    for (const ch of currentOthers) {
+      if (!keptIds.has(ch.id)) continue;
+      const chParentName = ch.parent?.name ?? null;
+      if (!chParentName) continue;
+      const desiredParentId = categoryIdByName.get(chParentName);
+      if (desiredParentId && ch.parentId !== desiredParentId) {
+        await ch.setParent(desiredParentId, { lockPermissions: false })
+          .catch((err) => log.errors.push(`Gắn lại danh mục cho "${ch.name}" lỗi: ${err.message}`));
+        await sleep(OP_DELAY_MS);
+      }
+    }
+
+    for (let pass = 0; pass < 2; pass++) {
+      const remaining = [...(await guild.channels.fetch()).values()]
+        .filter((c) => !keptIds.has(c.id) && !isProtectedChannelName(c.name));
+      if (remaining.length === 0) break;
+      for (const channel of remaining) {
+        const ok = await deleteChannelWithRetry(channel, log);
+        if (ok) log.deleted++;
+        await sleep(OP_DELAY_MS);
       }
     }
   } finally {
     isRestoring = false;
   }
+  if (log.errors.length) console.error("Restore errors:", log.errors);
+  return log;
 }
 
-// ── Danh sách lệnh text ───────────────────────────────────────────────
+async function createAntinukeLogChannel(guild) {
+  const existing = guild.channels.cache.find((c) => c.name === ANTINUKE_LOG_CHANNEL_NAME);
+  if (existing) return existing;
+  return guild.channels.create({
+    name: ANTINUKE_LOG_CHANNEL_NAME,
+    type: ChannelType.GuildText,
+    reason: "Thiết lập / tái lập bẫy chống nuke",
+    permissionOverwrites: [{ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] }],
+  });
+}
+
+function formatMuteDuration(minutes) {
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days} ngày`);
+  if (hours) parts.push(`${hours} giờ`);
+  if (mins) parts.push(`${mins} phút`);
+  return parts.length ? parts.join(" ") : "0 phút";
+}
+
+// ── Gửi thông báo kick/ban/mute vào kênh log: avatar, tên, id, lý do ────
+// Dùng chung cho cả anti-nuke lẫn honeypot.
+async function sendModerationLog(channel, { user, action, reason, muteMinutes }) {
+  const titleByAction = {
+    ban: "🔨 Đã BAN thành viên",
+    kick: "👢 Đã KICK thành viên",
+    mute: "🔇 Đã MUTE thành viên",
+  };
+  const colorByAction = { ban: 0xe74c3c, kick: 0xe67e22, mute: 0xf1c40f };
+  const embed = new EmbedBuilder()
+    .setColor(colorByAction[action] ?? 0x95a5a6)
+    .setTitle(titleByAction[action] ?? "⚠️ Đã xử lý thành viên")
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .addFields(
+      { name: "Tên", value: user.tag ?? user.username, inline: true },
+      { name: "ID", value: user.id, inline: true },
+    );
+  if (action === "mute" && muteMinutes) {
+    embed.addFields({ name: "Thời gian mute", value: formatMuteDuration(muteMinutes), inline: true });
+  }
+  embed.addFields({ name: "Lý do", value: reason });
+  embed.setTimestamp();
+  await channel.send({ embeds: [embed] });
+}
+
+// ── Honeypot: nội dung cảnh báo + số người đã bị bẫy ─────────────────────
+function buildHoneypotEmbed(trapCount, action, muteMinutes) {
+  const actionLabel =
+    action === "ban" ? "BAN" : action === "mute" ? `MUTE (${formatMuteDuration(muteMinutes)})` : "KICK";
+  return new EmbedBuilder()
+    .setColor(0xff0000)
+    .setTitle("⚠️ KHÔNG NHẮN VÀO KÊNH NÀY")
+    .setDescription(
+      `Kênh này dùng để bẫy tài khoản scam, bot spam tin nhắn, và kẻ nuke server.\n` +
+      `**Bất kỳ ai nhắn tin vào đây sẽ bị ${actionLabel} ngay lập tức.**`,
+    )
+    .addFields({ name: "Đã bẫy được", value: `${trapCount} người`, inline: true })
+    .setTimestamp();
+}
+
+// ── Tạo (hoặc tái sử dụng) kênh honeypot, cập nhật quyền + embed đếm ────
+async function createOrUpdateHoneypotChannel(guild, action, muteMinutes) {
+  let honeypot = loadHoneypot() ?? {};
+  const allChannels = await guild.channels.fetch();
+  let channel = allChannels.find((c) => c.name === HONEYPOT_CHANNEL_NAME);
+
+  if (!channel) {
+    channel = await guild.channels.create({
+      name: HONEYPOT_CHANNEL_NAME,
+      type: ChannelType.GuildText,
+      reason: "Thiết lập kênh bẫy honeypot",
+    });
+    await channel.setPosition(0).catch(() => {});
+  }
+
+  // Luôn đảm bảo @everyone nhìn thấy và nhắn được — kể cả người chưa verify —
+  // vì mục tiêu là dụ chính những tài khoản đáng ngờ nhất.
+  await channel.permissionOverwrites
+    .edit(guild.roles.everyone, { ViewChannel: true, SendMessages: true })
+    .catch(() => {});
+
+  const trapCount = honeypot.trapCount ?? 0;
+  const embed = buildHoneypotEmbed(trapCount, action, muteMinutes);
+
+  let infoMessage = honeypot.messageId
+    ? await channel.messages.fetch(honeypot.messageId).catch(() => null)
+    : null;
+  if (infoMessage) {
+    await infoMessage.edit({ embeds: [embed] }).catch(() => {});
+  } else {
+    infoMessage = await channel.send({ embeds: [embed] });
+  }
+
+  honeypot = { channelId: channel.id, messageId: infoMessage.id, action, muteMinutes, trapCount };
+  saveHoneypot(honeypot);
+
+  return { channel, message: infoMessage };
+}
+
+// ── Có người nhắn vào kênh honeypot → xử lý + cập nhật đếm + log ────────
+async function handleHoneypotTrigger(message, honeypot) {
+  const guild = message.guild;
+  const member = message.member ?? (await guild.members.fetch(message.author.id).catch(() => null));
+
+  // Bỏ qua chủ server / người có Role cao hơn bot — tránh tự khoá nhầm admin
+  if (member && hasPermission(guild, member, message.author.id)) {
+    await message.delete().catch(() => {});
+    return;
+  }
+
+  await message.delete().catch(() => {});
+
+  const reason = `Đã nhắn tin vào kênh bẫy honeypot (#${HONEYPOT_CHANNEL_NAME})`;
+  let actionTaken = false;
+  if (member) {
+    try {
+      if (honeypot.action === "ban") {
+        await member.ban({ reason });
+      } else if (honeypot.action === "mute") {
+        const ms = (honeypot.muteMinutes ?? MAX_MUTE_MINUTES) * 60 * 1000;
+        await member.timeout(ms, reason);
+      } else {
+        await member.kick(reason);
+      }
+      actionTaken = true;
+    } catch (err) {
+      console.error("Honeypot action lỗi:", err);
+    }
+  }
+
+  honeypot.trapCount = (honeypot.trapCount ?? 0) + 1;
+  saveHoneypot(honeypot);
+
+  const channel = guild.channels.cache.get(honeypot.channelId);
+  if (channel && honeypot.messageId) {
+    const embed = buildHoneypotEmbed(honeypot.trapCount, honeypot.action, honeypot.muteMinutes);
+    const infoMessage = await channel.messages.fetch(honeypot.messageId).catch(() => null);
+    if (infoMessage) await infoMessage.edit({ embeds: [embed] }).catch(() => {});
+  }
+
+  if (actionTaken) {
+    const logChannel = guild.channels.cache.find((c) => c.name === ANTINUKE_LOG_CHANNEL_NAME);
+    if (logChannel) {
+      await sendModerationLog(logChannel, {
+        user: message.author,
+        action: honeypot.action,
+        reason,
+        muteMinutes: honeypot.muteMinutes,
+      }).catch(() => {});
+    }
+  }
+}
+
+const HOW_TEXT = [
+  "**📖 Danh sách lệnh của bot**",
+  "",
+  "**!verifysetup**",
+  "Thiết lập hệ thống xác minh thành viên mới — tạo role + kênh verify, ẩn hết các kênh khác cho tới khi thành viên ấn ✅.",
+  "",
+  "**/saveconfig <ten>**",
+  "Lưu lại toàn bộ cấu trúc server hiện tại (kênh, danh mục, quyền, thứ tự) thành 1 bản có tên riêng.",
+  "",
+  "**/setconfig <ten>**",
+  "Đồng bộ server theo 1 bản đã lưu. Kênh nào giống hệt bản lưu sẽ được **giữ nguyên**. Kênh khác sẽ bị xoá và tạo lại.",
+  "",
+  "**/antinuke <hanhdong> <config> [thoigian]**",
+  "Kích hoạt bẫy chống nuke: tạo kênh ẩn #wxz-log. Nếu bị xoá, bot Kick/Ban/Mute người đó, đồng bộ theo config, tự tái lập bẫy và báo vào #wxz-log — rồi 3 giây sau kiểm tra lại lần 2.",
+  "",
+  "**/honeypotsetup <hanhdong> [thoigian]**",
+  "Tạo kênh #honeypot luôn hiển thị với mọi người (kể cả chưa verify). Bất kỳ ai nhắn tin vào đó sẽ bị Kick/Ban/Mute ngay, kênh hiện sẵn số người đã bị bẫy.",
+  "",
+  "**?how**",
+  "Hiện danh sách này.",
+  "",
+  "⚠️ Các lệnh !verifysetup, /saveconfig, /setconfig, /antinuke, /honeypotsetup chỉ dùng được nếu bạn có Role cao hơn Bot hoặc là chủ server.",
+].join("\n");
+
 const TEXT_COMMANDS = ["!verifysetup"];
 
 client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  const content = message.content.trim();
-  const isKnownCommand = TEXT_COMMANDS.some((cmd) => content === cmd || content.startsWith(cmd + " "));
-  if (!isKnownCommand) return;
-
-  if (!message.guild || !message.member) {
-    await message.reply("Lệnh này chỉ dùng được trong Server!");
-    return;
-  }
-  if (!hasPermission(message.guild, message.member, message.author.id)) {
-    await message.reply("❌ Bạn phải có Role cao hơn Bot mới được dùng lệnh này!");
-    return;
-  }
-
-  if (content === "!verifysetup") {
-    const guild = message.guild;
-    await message.reply("⏳ Đang thiết lập hệ thống verify, chờ chút...");
-    try {
-      let verifyRole = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
-      if (!verifyRole) {
-        verifyRole = await guild.roles.create({ name: VERIFY_ROLE_NAME, reason: "Thiết lập verify" });
-      }
-      let verifyChannel = guild.channels.cache.find(
-        (c) => c.name === VERIFY_CHANNEL_NAME && c.type === ChannelType.GuildText,
-      );
-      if (!verifyChannel) {
-        verifyChannel = await guild.channels.create({
-          name: VERIFY_CHANNEL_NAME, type: ChannelType.GuildText, reason: "Thiết lập verify",
-          permissionOverwrites: [
-            { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: verifyRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-          ],
-        });
-      }
-      for (const [, channel] of guild.channels.cache) {
-        if (channel.id === verifyChannel.id) continue;
-        try { await channel.permissionOverwrites.edit(verifyRole, { ViewChannel: false }); } catch {}
-      }
-      const verifyMessage = await verifyChannel.send(
-        `👋 Chào mừng! Vui lòng ấn vào ${VERIFY_EMOJI} bên dưới để xác minh và mở khoá toàn bộ server.`,
-      );
-      await verifyMessage.react(VERIFY_EMOJI);
-      saveState({ channelId: verifyChannel.id, messageId: verifyMessage.id });
-      await message.channel.send("✅ Đã thiết lập xong hệ thống verify!");
-    } catch (err) {
-      console.error(err);
-      await message.channel.send("❌ Lỗi — kiểm tra bot có quyền Manage Roles & Manage Channels không.");
-    }
-  }
-});
-
-// ── Slash commands + nút xác nhận ───────────────────────────────────────
-client.on("interactionCreate", async (interaction) => {
-  if (interaction.isButton()) {
-    if (!interaction.customId.startsWith("setconfig_confirm_")) return;
-    const name = interaction.customId.replace("setconfig_confirm_", "");
-    const configs = loadConfigs();
-    const config = configs[name];
-    if (!config) {
-      await interaction.update({ content: "❌ Không tìm thấy bản lưu này nữa.", components: [] });
-      return;
-    }
-    await interaction.update({ content: `⏳ Đang phục hồi cấu hình "${name}"...`, components: [] });
-    try {
-      await restoreGuildConfig(interaction.guild, config);
-      await interaction.followUp(`✅ Đã phục hồi xong cấu hình "${name}"!`);
-    } catch (err) {
-      console.error(err);
-      await interaction.followUp("❌ Có lỗi khi phục hồi — kiểm tra quyền bot.");
-    }
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-  if (!interaction.guild) {
-    await interaction.reply({ content: "Lệnh này chỉ dùng được trong Server!", ephemeral: true });
-    return;
-  }
-  const guildMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-  if (!guildMember || !hasPermission(interaction.guild, guildMember, interaction.user.id)) {
-    await interaction.reply({ content: "❌ Bạn phải có Role cao hơn Bot mới được dùng lệnh này!", ephemeral: true });
-    return;
-  }
-
-  const { commandName } = interaction;
-
-  if (commandName === "saveconfig") {
-    const name = interaction.options.getString("ten");
-    await interaction.deferReply();
-    try {
-      const config = captureGuildConfig(interaction.guild);
-      config.savedBy = interaction.user.tag;
-      const configs = loadConfigs();
-      configs[name] = config;
-      saveConfigs(configs);
-      await interaction.editReply(
-        `✅ Đã lưu cấu hình **${name}** (${config.channels.length} kênh, ${config.categories.length} danh mục).`,
-      );
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply("❌ Có lỗi khi lưu cấu hình.");
-    }
-  }
-
-  if (commandName === "setconfig") {
-    const name = interaction.options.getString("ten");
-    const configs = loadConfigs();
-    const config = configs[name];
-    if (!config) {
-      await interaction.reply({
-        content: `❌ Không tìm thấy bản lưu "${name}". Các bản đã lưu: ${Object.keys(configs).join(", ") || "(chưa có)"}`,
-        ephemeral: true,
-      });
-      return;
-    }
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`setconfig_confirm_${name}`)
-        .setLabel("⚠️ Xác nhận XOÁ hết kênh và phục hồi")
-        .setStyle(ButtonStyle.Danger),
-    );
-    await interaction.reply({
-      content: `⚠️ **Cảnh báo:** Sẽ xoá toàn bộ kênh hiện tại và tạo lại theo "${name}". Không thể hoàn tác.`,
-      components: [row],
-    });
-  }
-
-  if (commandName === "antinuke") {
-    const action = interaction.options.getString("hanhdong");
-    const configName = interaction.options.getString("config");
-    const configs = loadConfigs();
-    if (!configs[configName]) {
-      await interaction.reply({
-        content: `❌ Không tìm thấy bản lưu "${configName}". Chạy /saveconfig trước.`,
-        ephemeral: true,
-      });
-      return;
-    }
-    await interaction.deferReply();
-    try {
-      const guild = interaction.guild;
-      let logChannel = guild.channels.cache.find((c) => c.name === ANTINUKE_LOG_CHANNEL_NAME);
-      if (!logChannel) {
-        logChannel = await guild.channels.create({
-          name: ANTINUKE_LOG_CHANNEL_NAME, type: ChannelType.GuildText, reason: "Kích hoạt anti-nuke",
-          permissionOverwrites: [{ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] }],
-        });
-      }
-      saveAntinuke({ channelId: logChannel.id, action, configName });
-      await interaction.editReply(
-        `✅ Đã kích hoạt anti-nuke. Kênh bẫy: #${ANTINUKE_LOG_CHANNEL_NAME}. Nếu bị xoá, người xoá bị **${action}**, server tự khôi phục theo "${configName}".`,
-      );
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply("❌ Có lỗi khi kích hoạt anti-nuke.");
-    }
-  }
-});
-
-client.on("guildMemberAdd", async (member) => {
-  const verifyRole = member.guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
-  if (!verifyRole) return;
-  await member.roles.add(verifyRole).catch(console.error);
-});
-
-client.on("channelCreate", async (channel) => {
-  if (!channel.guild) return;
-  const state = loadState();
-  const verifyRole = channel.guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
-  if (!verifyRole || channel.id === state.channelId) return;
-  await channel.permissionOverwrites.edit(verifyRole, { ViewChannel: false }).catch(() => {});
-});
-
-// ── Anti-nuke: kênh bẫy bị xoá ───────────────────────────────────────────
-client.on("channelDelete", async (channel) => {
-  if (isRestoring) return;
-  const antinuke = loadAntinuke();
-  if (!antinuke || channel.id !== antinuke.channelId) return;
-  const guild = channel.guild;
-  if (!guild) return;
-
-  try {
-    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 5 });
-    const entry = auditLogs.entries.find(
-      (e) => e.target?.id === channel.id && Date.now() - e.createdTimestamp < 10000,
-    );
-    if (!entry || entry.executor.id === client.user.id) return; // không rõ ai, hoặc chính bot đang restore
-
-    const executorMember = await guild.members.fetch(entry.executor.id).catch(() => null);
-    if (executorMember) {
-      const reason = "Anti-nuke: xoá kênh log bảo vệ";
-      if (antinuke.action === "ban") {
-        await executorMember.ban({ reason }).catch((e) => console.error("Ban thất bại:", e));
-      } else {
-        await executorMember.kick(reason).catch((e) => console.error("Kick thất bại:", e));
-      }
-    }
-
-    const configs = loadConfigs();
-    const config = configs[antinuke.configName];
-    if (config) await restoreGuildConfig(guild, config);
-  } catch (err) {
-    console.error("Anti-nuke error:", err);
-  }
-});
-
-client.on("messageReactionAdd", async (reaction, user) => {
-  if (user.bot) return;
-  const state = loadState();
-  if (reaction.message.id !== state.messageId || reaction.emoji.name !== VERIFY_EMOJI) return;
-  if (reaction.partial) await reaction.fetch().catch(() => {});
-  const guild = reaction.message.guild;
-  if (!guild) return;
-  const member = await guild.members.fetch(user.id).catch(() => null);
-  if (!member) return;
-  const verifyRole = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
-  if (verifyRole && member.roles.cache.has(verifyRole.id)) {
-    await member.roles.remove(verifyRole).catch(console.error);
-  }
-});
-
-client.login(token).catch(console.error);
+  if (message.author.id === client.user.id) return; // kh
