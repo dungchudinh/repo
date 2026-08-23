@@ -77,6 +77,46 @@ function hasPermission(guild, member, authorId) {
   );
 }
 
+const NOITU_WORDS = [
+  "học sinh", "sinh viên", "viên chức", "chức vụ", "vụ án", "án mạng",
+  "mạng lưới", "lưới điện", "điện thoại", "giáo viên", "giáo sư", "bác sĩ",
+  "y tá", "kỹ sư", "công nhân", "nông dân", "thương nhân", "doanh nhân",
+  "luật sư", "ca sĩ", "nhạc sĩ", "họa sĩ", "nhà văn", "nhà thơ",
+  "phóng viên", "biên tập", "tổng thống", "thủ tướng", "bộ trưởng", "hiệu trưởng",
+  "giám đốc", "nhân viên", "khách hàng", "chủ nhà", "hàng xóm", "bạn bè",
+  "gia đình", "cha mẹ", "con cái", "anh chị", "ông bà", "cô chú",
+  "dì dượng", "mặt trời", "mặt trăng", "bầu trời", "mặt đất", "ngọn núi",
+  "dòng sông", "con suối", "bãi biển", "đại dương", "hòn đảo", "cánh đồng",
+  "khu rừng", "con đường", "cây cối", "bông hoa", "chiếc lá", "cành cây",
+  "rễ cây", "hạt giống", "mùa xuân", "mùa hè", "mùa thu", "mùa đông",
+  "cơn mưa", "ánh nắng", "làn gió", "đám mây", "tia chớp", "cơn bão",
+  "trận lụt", "con chó", "con mèo", "con gà", "con vịt", "con heo",
+  "con bò", "con trâu", "con ngựa", "con dê", "con cừu", "con chim",
+  "con cá", "con rắn", "con voi", "con hổ", "sư tử", "con gấu",
+  "con thỏ", "con sóc", "con chuột", "con ruồi", "con muỗi", "con kiến",
+  "con ong", "con bướm", "con nhện", "lớp học", "trường học", "bài học",
+  "bài tập", "bài thi", "kỳ thi", "kỳ nghỉ", "năm học", "môn học",
+  "giờ học", "sách vở", "bút mực", "bảng đen", "phấn trắng", "cặp sách",
+  "đồng phục", "công việc", "việc làm", "nghề nghiệp", "tiền lương", "tiền bạc",
+  "kinh tế", "xã hội", "chính trị", "pháp luật", "quyền lợi", "nghĩa vụ",
+  "trách nhiệm", "quyết định", "kế hoạch", "dự án", "hợp đồng", "công ty",
+  "doanh nghiệp", "thị trường", "sản phẩm", "dịch vụ", "bữa ăn", "bữa sáng",
+  "bữa trưa", "bữa tối", "món ăn", "thức ăn", "đồ uống", "cơm trắng",
+  "bánh mì", "bánh kẹo", "trái cây", "rau xanh", "thịt heo", "thịt bò",
+  "thịt gà", "cá kho", "canh chua", "nước mắm", "đường cát", "muối tiêu",
+  "cái bàn", "cái ghế", "cái giường", "cái tủ", "cái cửa", "cửa sổ",
+  "mái nhà", "sân nhà", "chiếc xe", "xe máy", "xe đạp", "xe hơi",
+  "điện tử", "máy tính", "ti vi", "tủ lạnh", "máy giặt", "quạt máy",
+  "đèn điện", "tình yêu", "tình bạn", "tình cảm", "hạnh phúc", "đau khổ",
+  "niềm vui", "nỗi buồn", "hy vọng", "ước mơ", "tương lai", "quá khứ",
+  "hiện tại", "thời gian", "không gian", "cuộc sống", "cuộc đời", "số phận",
+  "may mắn", "thành công", "thất bại", "cái đầu", "khuôn mặt", "đôi mắt",
+  "cái mũi", "cái miệng", "đôi tai", "mái tóc", "đôi tay", "bàn tay",
+  "ngón tay", "đôi chân", "bàn chân", "trái tim", "lá gan", "buồng phổi",
+  "quốc gia", "văn hóa", "hóa học", "vật lý", "lý thuyết",
+];
+const noituWordSet = new Set(NOITU_WORDS.map((w) => w.toLowerCase()));
+
 const slashCommands = [
   new SlashCommandBuilder()
     .setName("saveconfig")
@@ -110,7 +150,7 @@ const slashCommands = [
     )
     .addIntegerOption((opt) =>
       opt.setName("thoigian")
-        .setDescription("Số phút mute — chỉ dùng khi chọn Mute (mặc định 40320 phút = 28 ngày)")
+        .setDescription("Số phút mute (mặc định 40320 = 28 ngày)")
         .setRequired(false)
         .setMinValue(1)
         .setMaxValue(MAX_MUTE_MINUTES),
@@ -130,22 +170,37 @@ const slashCommands = [
     )
     .addIntegerOption((opt) =>
       opt.setName("thoigian")
-        .setDescription("Số phút mute — chỉ dùng khi chọn Mute (mặc định 40320 phút = 28 ngày)")
+        .setDescription("Số phút mute (mặc định 40320 = 28 ngày)")
         .setRequired(false)
         .setMinValue(1)
         .setMaxValue(MAX_MUTE_MINUTES),
     ),
 ].map((cmd) => cmd.toJSON());
 
+// ── Đăng ký lệnh RIÊNG CHO TỪNG SERVER thay vì đăng ký global ───────────
+// Lệnh global mất tới 1 tiếng mới đồng bộ mỗi khi thay đổi; lệnh theo
+// từng server (guild command) có hiệu lực NGAY LẬP TỨC.
+async function registerCommandsForGuild(rest, guild) {
+  try {
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: slashCommands });
+    console.log(`Đã đăng ký lệnh cho server: ${guild.name}`);
+  } catch (err) {
+    console.error(`Đăng ký lệnh cho server ${guild.name} thất bại:`, err);
+  }
+}
+
 client.on("clientReady", async (readyClient) => {
   console.log(`Bot online: ${readyClient.user.tag}`);
-  try {
-    const rest = new REST().setToken(token);
-    await rest.put(Routes.applicationCommands(readyClient.user.id), { body: slashCommands });
-    console.log("Slash commands registered");
-  } catch (err) {
-    console.error("Failed to register slash commands", err);
+  const rest = new REST().setToken(token);
+  for (const guild of readyClient.guilds.cache.values()) {
+    await registerCommandsForGuild(rest, guild);
   }
+});
+
+// Bot vào server mới sau này cũng tự đăng ký lệnh ngay, không cần chờ
+client.on("guildCreate", async (guild) => {
+  const rest = new REST().setToken(token);
+  await registerCommandsForGuild(rest, guild);
 });
 
 function normalizeOverwrites(channel) {
@@ -399,8 +454,6 @@ function formatMuteDuration(minutes) {
   return parts.length ? parts.join(" ") : "0 phút";
 }
 
-// ── Gửi thông báo kick/ban/mute vào kênh log: avatar, tên, id, lý do ────
-// Dùng chung cho cả anti-nuke lẫn honeypot.
 async function sendModerationLog(channel, { user, action, reason, muteMinutes }) {
   const titleByAction = {
     ban: "🔨 Đã BAN thành viên",
@@ -424,7 +477,6 @@ async function sendModerationLog(channel, { user, action, reason, muteMinutes })
   await channel.send({ embeds: [embed] });
 }
 
-// ── Honeypot: nội dung cảnh báo + số người đã bị bẫy ─────────────────────
 function buildHoneypotEmbed(trapCount, action, muteMinutes) {
   const actionLabel =
     action === "ban" ? "BAN" : action === "mute" ? `MUTE (${formatMuteDuration(muteMinutes)})` : "KICK";
@@ -439,7 +491,6 @@ function buildHoneypotEmbed(trapCount, action, muteMinutes) {
     .setTimestamp();
 }
 
-// ── Tạo (hoặc tái sử dụng) kênh honeypot, cập nhật quyền + embed đếm ────
 async function createOrUpdateHoneypotChannel(guild, action, muteMinutes) {
   let honeypot = loadHoneypot() ?? {};
   const allChannels = await guild.channels.fetch();
@@ -454,8 +505,6 @@ async function createOrUpdateHoneypotChannel(guild, action, muteMinutes) {
     await channel.setPosition(0).catch(() => {});
   }
 
-  // Luôn đảm bảo @everyone nhìn thấy và nhắn được — kể cả người chưa verify —
-  // vì mục tiêu là dụ chính những tài khoản đáng ngờ nhất.
   await channel.permissionOverwrites
     .edit(guild.roles.everyone, { ViewChannel: true, SendMessages: true })
     .catch(() => {});
@@ -478,85 +527,13 @@ async function createOrUpdateHoneypotChannel(guild, action, muteMinutes) {
   return { channel, message: infoMessage };
 }
 
-// ── Có người nhắn vào kênh honeypot → xử lý + cập nhật đếm + log ────────
 async function handleHoneypotTrigger(message, honeypot) {
   const guild = message.guild;
   const member = message.member ?? (await guild.members.fetch(message.author.id).catch(() => null));
 
-  // Bỏ qua chủ server / người có Role cao hơn bot — tránh tự khoá nhầm admin
   if (member && hasPermission(guild, member, message.author.id)) {
     await message.delete().catch(() => {});
     return;
   }
 
-  await message.delete().catch(() => {});
-
-  const reason = `Đã nhắn tin vào kênh bẫy honeypot (#${HONEYPOT_CHANNEL_NAME})`;
-  let actionTaken = false;
-  if (member) {
-    try {
-      if (honeypot.action === "ban") {
-        await member.ban({ reason });
-      } else if (honeypot.action === "mute") {
-        const ms = (honeypot.muteMinutes ?? MAX_MUTE_MINUTES) * 60 * 1000;
-        await member.timeout(ms, reason);
-      } else {
-        await member.kick(reason);
-      }
-      actionTaken = true;
-    } catch (err) {
-      console.error("Honeypot action lỗi:", err);
-    }
-  }
-
-  honeypot.trapCount = (honeypot.trapCount ?? 0) + 1;
-  saveHoneypot(honeypot);
-
-  const channel = guild.channels.cache.get(honeypot.channelId);
-  if (channel && honeypot.messageId) {
-    const embed = buildHoneypotEmbed(honeypot.trapCount, honeypot.action, honeypot.muteMinutes);
-    const infoMessage = await channel.messages.fetch(honeypot.messageId).catch(() => null);
-    if (infoMessage) await infoMessage.edit({ embeds: [embed] }).catch(() => {});
-  }
-
-  if (actionTaken) {
-    const logChannel = guild.channels.cache.find((c) => c.name === ANTINUKE_LOG_CHANNEL_NAME);
-    if (logChannel) {
-      await sendModerationLog(logChannel, {
-        user: message.author,
-        action: honeypot.action,
-        reason,
-        muteMinutes: honeypot.muteMinutes,
-      }).catch(() => {});
-    }
-  }
-}
-
-const HOW_TEXT = [
-  "**📖 Danh sách lệnh của bot**",
-  "",
-  "**!verifysetup**",
-  "Thiết lập hệ thống xác minh thành viên mới — tạo role + kênh verify, ẩn hết các kênh khác cho tới khi thành viên ấn ✅.",
-  "",
-  "**/saveconfig <ten>**",
-  "Lưu lại toàn bộ cấu trúc server hiện tại (kênh, danh mục, quyền, thứ tự) thành 1 bản có tên riêng.",
-  "",
-  "**/setconfig <ten>**",
-  "Đồng bộ server theo 1 bản đã lưu. Kênh nào giống hệt bản lưu sẽ được **giữ nguyên**. Kênh khác sẽ bị xoá và tạo lại.",
-  "",
-  "**/antinuke <hanhdong> <config> [thoigian]**",
-  "Kích hoạt bẫy chống nuke: tạo kênh ẩn #wxz-log. Nếu bị xoá, bot Kick/Ban/Mute người đó, đồng bộ theo config, tự tái lập bẫy và báo vào #wxz-log — rồi 3 giây sau kiểm tra lại lần 2.",
-  "",
-  "**/honeypotsetup <hanhdong> [thoigian]**",
-  "Tạo kênh #honeypot luôn hiển thị với mọi người (kể cả chưa verify). Bất kỳ ai nhắn tin vào đó sẽ bị Kick/Ban/Mute ngay, kênh hiện sẵn số người đã bị bẫy.",
-  "",
-  "**?how**",
-  "Hiện danh sách này.",
-  "",
-  "⚠️ Các lệnh !verifysetup, /saveconfig, /setconfig, /antinuke, /honeypotsetup chỉ dùng được nếu bạn có Role cao hơn Bot hoặc là chủ server.",
-].join("\n");
-
-const TEXT_COMMANDS = ["!verifysetup"];
-
-client.on("messageCreate", async (message) => {
-  if (message.author.id === client.user.id) return; // kh
+  await message.
