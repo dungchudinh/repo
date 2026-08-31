@@ -536,4 +536,252 @@ async function handleHoneypotTrigger(message, honeypot) {
     return;
   }
 
-  await message.
+  // Người không có quyền (không phải chủ server / role thấp hơn bot) nhắn vào
+  // kênh bẫy → xoá tin nhắn và xử lý theo hành động đã cấu hình.
+  await message.delete().catch(() => {});
+
+  const { action, muteMinutes } = honeypot;
+  const reason = "Nhắn tin vào kênh honeypot (bẫy chống spam/nuke)";
+
+  try {
+    if (action === "ban") {
+      await guild.members.ban(message.author.id, { reason });
+    } else if (action === "kick") {
+      if (member) await member.kick(reason);
+    } else if (action === "mute") {
+      if (member) {
+        const ms = (muteMinutes ?? MAX_MUTE_MINUTES) * 60 * 1000;
+        await member.timeout(ms, reason);
+      }
+    }
+  } catch (err) {
+    console.error(`Xử lý honeypot cho ${message.author.tag ?? message.author.id} lỗi:`, err.message);
+  }
+
+  honeypot.trapCount = (honeypot.trapCount ?? 0) + 1;
+  saveHoneypot(honeypot);
+
+  // Cập nhật số đếm trên embed đã ghim trong kênh honeypot
+  try {
+    const channel = await guild.channels.fetch(honeypot.channelId).catch(() => null);
+    const infoMessage = channel
+      ? await channel.messages.fetch(honeypot.messageId).catch(() => null)
+      : null;
+    if (infoMessage) {
+      await infoMessage
+        .edit({ embeds: [buildHoneypotEmbed(honeypot.trapCount, action, muteMinutes)] })
+        .catch(() => {});
+    }
+  } catch (err) {
+    console.error("Cập nhật embed honeypot lỗi:", err.message);
+  }
+
+  // Ghi log vào kênh wxz-log (nếu đã được thiết lập)
+  const logChannel = guild.channels.cache.find((c) => c.name === ANTINUKE_LOG_CHANNEL_NAME);
+  if (logChannel) {
+    await sendModerationLog(logChannel, { user: message.author, action, reason, muteMinutes }).catch((err) =>
+      console.error("Gửi log honeypot lỗi:", err.message),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// messageCreate: kiểm tra xem tin nhắn có nằm trong kênh honeypot không
+// ─────────────────────────────────────────────────────────────────────────
+client.on("messageCreate", async (message) => {
+  if (message.author.bot || !message.guild) return;
+  const honeypot = loadHoneypot();
+  if (honeypot && message.channel.id === honeypot.channelId) {
+    await handleHoneypotTrigger(message, honeypot).catch((err) =>
+      console.error("handleHoneypotTrigger lỗi:", err.message),
+    );
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// messageReactionAdd: xác thực thành viên khi thả reaction ✅ trong #verify
+// ─────────────────────────────────────────────────────────────────────────
+client.on("messageReactionAdd", async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (reaction.partial) await reaction.fetch();
+    if (user.partial) await user.fetch();
+
+    const { message } = reaction;
+    const guild = message.guild;
+    if (!guild) return;
+    if (message.channel.name !== VERIFY_CHANNEL_NAME) return;
+    if (reaction.emoji.name !== VERIFY_EMOJI) return;
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) return;
+
+    let role = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
+    if (!role) {
+      role = await guild.roles.create({ name: VERIFY_ROLE_NAME, reason: "Tự tạo role verify" });
+    }
+    if (!member.roles.cache.has(role.id)) {
+      await member.roles.add(role, "Xác thực qua reaction ✅");
+    }
+  } catch (err) {
+    console.error("Xử lý reaction verify lỗi:", err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// channelDelete: bẫy chống nuke — phát hiện ai xoá kênh log #wxz-log
+// (bot cần quyền "View Audit Log" để tra ra người xoá)
+// ─────────────────────────────────────────────────────────────────────────
+client.on("channelDelete", async (channel) => {
+  if (isRestoring) return;
+  if (channel.name !== ANTINUKE_LOG_CHANNEL_NAME) return;
+  const guild = channel.guild;
+  if (!guild) return;
+
+  const antinuke = loadAntinuke();
+  if (!antinuke) return;
+
+  let executor = null;
+  try {
+    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 5 });
+    const entry = auditLogs.entries.find((e) => e.target?.id === channel.id);
+    executor = entry?.executor ?? null;
+  } catch (err) {
+    console.error("Đọc audit log lỗi (bot cần quyền 'View Audit Log'):", err.message);
+  }
+  if (!executor || executor.id === client.user.id) return;
+
+  const member = await guild.members.fetch(executor.id).catch(() => null);
+  if (member && hasPermission(guild, member, executor.id)) {
+    // Chủ server / người có quyền cao hơn bot tự xoá kênh log — chỉ tạo lại, không xử lý
+    await createAntinukeLogChannel(guild).catch(() => {});
+    return;
+  }
+
+  const { action, muteMinutes, config: configName } = antinuke;
+  const reason = "Xoá kênh log chống nuke";
+
+  try {
+    if (action === "ban") {
+      await guild.members.ban(executor.id, { reason });
+    } else if (action === "kick") {
+      if (member) await member.kick(reason);
+    } else if (action === "mute") {
+      if (member) {
+        const ms = (muteMinutes ?? MAX_MUTE_MINUTES) * 60 * 1000;
+        await member.timeout(ms, reason);
+      }
+    }
+  } catch (err) {
+    console.error(`Xử lý kẻ nuke ${executor.tag ?? executor.id} lỗi:`, err.message);
+  }
+
+  const newLogChannel = await createAntinukeLogChannel(guild).catch(() => null);
+  if (newLogChannel) {
+    await sendModerationLog(newLogChannel, { user: executor, action, reason, muteMinutes }).catch(() => {});
+  }
+
+  const configs = loadConfigs();
+  const savedConfig = configs[configName];
+  if (savedConfig) {
+    await restoreGuildConfig(guild, savedConfig).catch((err) =>
+      console.error("Khôi phục cấu hình sau nuke lỗi:", err.message),
+    );
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// interactionCreate: xử lý 4 slash command (chỉ cho Administrator dùng)
+// ─────────────────────────────────────────────────────────────────────────
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const { guild, member, commandName } = interaction;
+  if (!guild || !member) {
+    await interaction.reply({ content: "Lệnh này chỉ dùng được trong server.", ephemeral: true });
+    return;
+  }
+
+  if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({ content: "Bạn cần quyền Administrator để dùng lệnh này.", ephemeral: true });
+    return;
+  }
+
+  try {
+    if (commandName === "saveconfig") {
+      const ten = interaction.options.getString("ten", true);
+      await interaction.deferReply();
+      const config = captureGuildConfig(guild);
+      config.savedBy = interaction.user.id;
+      const configs = loadConfigs();
+      configs[ten] = config;
+      saveConfigs(configs);
+      await interaction.editReply(`Đã lưu cấu hình server với tên **${ten}**.`);
+      return;
+    }
+
+    if (commandName === "setconfig") {
+      const ten = interaction.options.getString("ten", true);
+      const configs = loadConfigs();
+      const config = configs[ten];
+      if (!config) {
+        await interaction.reply({ content: `Không tìm thấy bản lưu tên **${ten}**.`, ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      const log = await restoreGuildConfig(guild, config);
+      await interaction.editReply(
+        `Đồng bộ xong: giữ ${log.kept}, xoá ${log.deleted}, tạo mới ${log.created}` +
+          (log.errors.length ? `, ${log.errors.length} lỗi (xem console).` : "."),
+      );
+      return;
+    }
+
+    if (commandName === "antinuke") {
+      const hanhdong = interaction.options.getString("hanhdong", true);
+      const configName = interaction.options.getString("config", true);
+      const thoigian = interaction.options.getInteger("thoigian") ?? MAX_MUTE_MINUTES;
+
+      const configs = loadConfigs();
+      if (!configs[configName]) {
+        await interaction.reply({
+          content: `Không tìm thấy bản lưu cấu hình tên **${configName}**. Hãy dùng /saveconfig trước.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.deferReply();
+      await createAntinukeLogChannel(guild);
+      saveAntinuke({ action: hanhdong, config: configName, muteMinutes: thoigian });
+      await interaction.editReply(
+        `Đã bật chống nuke. Nếu #${ANTINUKE_LOG_CHANNEL_NAME} bị xoá, kẻ xoá sẽ bị **${hanhdong}** ` +
+          `và server sẽ tự khôi phục theo cấu hình **${configName}**.`,
+      );
+      return;
+    }
+
+    if (commandName === "honeypotsetup") {
+      const hanhdong = interaction.options.getString("hanhdong", true);
+      const thoigian = interaction.options.getInteger("thoigian") ?? MAX_MUTE_MINUTES;
+
+      await interaction.deferReply();
+      await createOrUpdateHoneypotChannel(guild, hanhdong, thoigian);
+      await interaction.editReply(`Đã thiết lập kênh honeypot. Ai nhắn vào đó sẽ bị **${hanhdong}**.`);
+      return;
+    }
+  } catch (err) {
+    console.error(`Lệnh ${commandName} lỗi:`, err);
+    const payload = { content: "Có lỗi xảy ra khi xử lý lệnh, xem log console.", ephemeral: true };
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(payload).catch(() => {});
+    } else {
+      await interaction.reply(payload).catch(() => {});
+    }
+  }
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled promise rejection:", err);
+});
+
+client.login(token);
