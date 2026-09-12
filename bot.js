@@ -17,7 +17,6 @@ import {
 import { fileURLToPath } from "url";
 import path from "path";
 import fs from "fs";
-import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "verify-state.json");
@@ -247,7 +246,7 @@ function buildPermissionOptions(allowStr, denyStr) {
 
 const MAX_DELETE_RETRIES = 3;
 const MAX_CREATE_RETRIES = 3;
-const OP_DELAY_MS = 350;
+const RETRY_BACKOFF_MS = 200; // chỉ dùng khi 1 thao tác lỗi và cần thử lại
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -261,7 +260,7 @@ async function deleteChannelWithRetry(channel, log) {
     } catch (err) {
       log.errors.push(`Xoá "${channel.name}" lỗi (lần ${attempt}): ${err.message}`);
       if (attempt === MAX_DELETE_RETRIES) return false;
-      await sleep(OP_DELAY_MS * attempt);
+      await sleep(RETRY_BACKOFF_MS * attempt);
     }
   }
   return false;
@@ -274,12 +273,18 @@ async function createChannelWithRetry(guild, options, log) {
     } catch (err) {
       log.errors.push(`Tạo "${options.name}" lỗi (lần ${attempt}): ${err.message}`);
       if (attempt === MAX_CREATE_RETRIES) return null;
-      await sleep(OP_DELAY_MS * attempt);
+      await sleep(RETRY_BACKOFF_MS * attempt);
     }
   }
   return null;
 }
 
+// Ghi chú tốc độ: các thao tác xoá/tạo/gắn quyền ĐỘC LẬP với nhau (khác kênh)
+// được chạy SONG SONG bằng Promise.all thay vì xếp hàng chờ 350ms sau MỖI
+// bước như bản trước — đó là lý do đồng bộ 1 server hay bị mất ~20 giây dù
+// chỉ đổi vài kênh. discord.js tự đọc header rate-limit của Discord và tự
+// giãn cách request nếu thật sự cần (kể cả 429), nên vẫn an toàn — chỉ là
+// không còn phải đợi "cho chắc" khi Discord chưa hề giới hạn gì cả.
 async function restoreGuildConfig(guild, config) {
   isRestoring = true;
   const log = { kept: 0, deleted: 0, created: 0, errors: [] };
@@ -343,77 +348,91 @@ async function restoreGuildConfig(guild, config) {
       }
     }
 
-    for (const channel of channelsToDelete) {
-      const ok = await deleteChannelWithRetry(channel, log);
-      if (ok) log.deleted++;
-      await sleep(OP_DELAY_MS);
-    }
-    for (const channel of categoriesToDelete) {
-      const ok = await deleteChannelWithRetry(channel, log);
-      if (ok) log.deleted++;
-      await sleep(OP_DELAY_MS);
-    }
+    // Xoá kênh + danh mục không khớp — không phụ thuộc lẫn nhau nên chạy song song.
+    await Promise.all(
+      [...channelsToDelete, ...categoriesToDelete].map(async (channel) => {
+        const ok = await deleteChannelWithRetry(channel, log);
+        if (ok) log.deleted++;
+      }),
+    );
 
     if (config.guildName && config.guildName !== guild.name) {
       await guild.setName(config.guildName).catch((err) => log.errors.push(`Đổi tên server lỗi: ${err.message}`));
     }
 
+    // Tạo danh mục còn thiếu (song song với nhau); phải xong ở đây để có ID
+    // thật thì bước tạo kênh bên dưới mới gắn đúng cha.
     const categoryIdByName = new Map();
     for (const [name, ch] of keptCategoryByConfigName) categoryIdByName.set(name, ch.id);
-    for (let i = 0; i < config.categories.length; i++) {
-      if (usedCategoryIdx.has(i)) continue;
-      const cat = config.categories[i];
-      const created = await createChannelWithRetry(guild, { name: cat.name, type: ChannelType.GuildCategory }, log);
-      if (!created) continue;
-      log.created++;
-      keptIds.add(created.id);
-      categoryIdByName.set(cat.name, created.id);
-      for (const ow of cat.overwrites) {
-        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
-          .catch((err) => log.errors.push(`Set quyền danh mục "${cat.name}" lỗi: ${err.message}`));
-      }
-      await sleep(OP_DELAY_MS);
-    }
+    const categoriesToCreate = config.categories.filter((_, i) => !usedCategoryIdx.has(i));
+    await Promise.all(
+      categoriesToCreate.map(async (cat) => {
+        const created = await createChannelWithRetry(guild, { name: cat.name, type: ChannelType.GuildCategory }, log);
+        if (!created) return;
+        log.created++;
+        keptIds.add(created.id);
+        categoryIdByName.set(cat.name, created.id);
+        await Promise.all(
+          cat.overwrites.map((ow) =>
+            created.permissionOverwrites
+              .create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
+              .catch((err) => log.errors.push(`Set quyền danh mục "${cat.name}" lỗi: ${err.message}`)),
+          ),
+        );
+      }),
+    );
 
-    for (let i = 0; i < config.channels.length; i++) {
-      if (usedChannelIdx.has(i)) continue;
-      const ch = config.channels[i];
-      const created = await createChannelWithRetry(guild, {
-        name: ch.name, type: ch.type,
-        parent: ch.parentName ? categoryIdByName.get(ch.parentName) : undefined,
-        topic: ch.topic ?? undefined,
-      }, log);
-      if (!created) continue;
-      log.created++;
-      keptIds.add(created.id);
-      for (const ow of ch.overwrites) {
-        await created.permissionOverwrites.create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
-          .catch((err) => log.errors.push(`Set quyền kênh "${ch.name}" lỗi: ${err.message}`));
-      }
-      await sleep(OP_DELAY_MS);
-    }
+    // Tạo kênh còn thiếu — song song với nhau, danh mục cha đã có ID ở trên.
+    const channelsToCreate = config.channels.filter((_, i) => !usedChannelIdx.has(i));
+    await Promise.all(
+      channelsToCreate.map(async (ch) => {
+        const created = await createChannelWithRetry(
+          guild,
+          {
+            name: ch.name, type: ch.type,
+            parent: ch.parentName ? categoryIdByName.get(ch.parentName) : undefined,
+            topic: ch.topic ?? undefined,
+          },
+          log,
+        );
+        if (!created) return;
+        log.created++;
+        keptIds.add(created.id);
+        await Promise.all(
+          ch.overwrites.map((ow) =>
+            created.permissionOverwrites
+              .create(ow.id, buildPermissionOptions(ow.allow, ow.deny))
+              .catch((err) => log.errors.push(`Set quyền kênh "${ch.name}" lỗi: ${err.message}`)),
+          ),
+        );
+      }),
+    );
 
-    for (const ch of currentOthers) {
-      if (!keptIds.has(ch.id)) continue;
-      const chParentName = ch.parent?.name ?? null;
-      if (!chParentName) continue;
-      const desiredParentId = categoryIdByName.get(chParentName);
-      if (desiredParentId && ch.parentId !== desiredParentId) {
-        await ch.setParent(desiredParentId, { lockPermissions: false })
-          .catch((err) => log.errors.push(`Gắn lại danh mục cho "${ch.name}" lỗi: ${err.message}`));
-        await sleep(OP_DELAY_MS);
-      }
-    }
+    // Gắn lại danh mục cho kênh được giữ nhưng sai cha — song song.
+    await Promise.all(
+      currentOthers.map(async (ch) => {
+        if (!keptIds.has(ch.id)) return;
+        const chParentName = ch.parent?.name ?? null;
+        if (!chParentName) return;
+        const desiredParentId = categoryIdByName.get(chParentName);
+        if (desiredParentId && ch.parentId !== desiredParentId) {
+          await ch
+            .setParent(desiredParentId, { lockPermissions: false })
+            .catch((err) => log.errors.push(`Gắn lại danh mục cho "${ch.name}" lỗi: ${err.message}`));
+        }
+      }),
+    );
 
     for (let pass = 0; pass < 2; pass++) {
       const remaining = [...(await guild.channels.fetch()).values()]
         .filter((c) => !keptIds.has(c.id) && !isProtectedChannelName(c.name));
       if (remaining.length === 0) break;
-      for (const channel of remaining) {
-        const ok = await deleteChannelWithRetry(channel, log);
-        if (ok) log.deleted++;
-        await sleep(OP_DELAY_MS);
-      }
+      await Promise.all(
+        remaining.map(async (channel) => {
+          const ok = await deleteChannelWithRetry(channel, log);
+          if (ok) log.deleted++;
+        }),
+      );
     }
   } finally {
     isRestoring = false;
@@ -605,17 +624,18 @@ async function disableExternalAppsEveryone(guild) {
   const channels = await guild.channels.fetch();
   const everyone = guild.roles.everyone;
 
-  for (const channel of channels.values()) {
-    if (!channel || channel.isThread?.()) continue;
-    try {
-      // .edit() chỉ đụng đúng 1 quyền này — mọi allow/deny khác trên kênh giữ nguyên
-      await channel.permissionOverwrites.edit(everyone, { UseExternalApps: false });
-      result.updated++;
-    } catch (err) {
-      result.errors.push(`"${channel.name}": ${err.message}`);
-    }
-    await sleep(OP_DELAY_MS);
-  }
+  await Promise.all(
+    [...channels.values()].map(async (channel) => {
+      if (!channel || channel.isThread?.()) return;
+      try {
+        // .edit() chỉ đụng đúng 1 quyền này — mọi allow/deny khác trên kênh giữ nguyên
+        await channel.permissionOverwrites.edit(everyone, { UseExternalApps: false });
+        result.updated++;
+      } catch (err) {
+        result.errors.push(`"${channel.name}": ${err.message}`);
+      }
+    }),
+  );
 
   return result;
 }
