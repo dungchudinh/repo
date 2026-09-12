@@ -12,6 +12,7 @@ import {
   ButtonStyle,
   AuditLogEvent,
   EmbedBuilder,
+  AttachmentBuilder,
 } from "discord.js";
 import { fileURLToPath } from "url";
 import path from "path";
@@ -27,9 +28,15 @@ const VERIFY_CHANNEL_NAME = "verify";
 const VERIFY_EMOJI = "✅";
 const ANTINUKE_LOG_CHANNEL_NAME = "wxz-log";
 const HONEYPOT_CHANNEL_NAME = "honeypot";
+const BACKUP_CHANNEL_NAME = "wxz-backup";
 const MAX_MUTE_MINUTES = 40320; // 28 ngày — tối đa Discord cho phép
 
-const PROTECTED_CHANNEL_NAMES = new Set([ANTINUKE_LOG_CHANNEL_NAME, HONEYPOT_CHANNEL_NAME]);
+const PROTECTED_CHANNEL_NAMES = new Set([
+  ANTINUKE_LOG_CHANNEL_NAME,
+  HONEYPOT_CHANNEL_NAME,
+  VERIFY_CHANNEL_NAME,
+  BACKUP_CHANNEL_NAME,
+]);
 function isProtectedChannelName(name) {
   return PROTECTED_CHANNEL_NAMES.has(name);
 }
@@ -76,46 +83,6 @@ function hasPermission(guild, member, authorId) {
     member.roles.highest.position > me.roles.highest.position
   );
 }
-
-const NOITU_WORDS = [
-  "học sinh", "sinh viên", "viên chức", "chức vụ", "vụ án", "án mạng",
-  "mạng lưới", "lưới điện", "điện thoại", "giáo viên", "giáo sư", "bác sĩ",
-  "y tá", "kỹ sư", "công nhân", "nông dân", "thương nhân", "doanh nhân",
-  "luật sư", "ca sĩ", "nhạc sĩ", "họa sĩ", "nhà văn", "nhà thơ",
-  "phóng viên", "biên tập", "tổng thống", "thủ tướng", "bộ trưởng", "hiệu trưởng",
-  "giám đốc", "nhân viên", "khách hàng", "chủ nhà", "hàng xóm", "bạn bè",
-  "gia đình", "cha mẹ", "con cái", "anh chị", "ông bà", "cô chú",
-  "dì dượng", "mặt trời", "mặt trăng", "bầu trời", "mặt đất", "ngọn núi",
-  "dòng sông", "con suối", "bãi biển", "đại dương", "hòn đảo", "cánh đồng",
-  "khu rừng", "con đường", "cây cối", "bông hoa", "chiếc lá", "cành cây",
-  "rễ cây", "hạt giống", "mùa xuân", "mùa hè", "mùa thu", "mùa đông",
-  "cơn mưa", "ánh nắng", "làn gió", "đám mây", "tia chớp", "cơn bão",
-  "trận lụt", "con chó", "con mèo", "con gà", "con vịt", "con heo",
-  "con bò", "con trâu", "con ngựa", "con dê", "con cừu", "con chim",
-  "con cá", "con rắn", "con voi", "con hổ", "sư tử", "con gấu",
-  "con thỏ", "con sóc", "con chuột", "con ruồi", "con muỗi", "con kiến",
-  "con ong", "con bướm", "con nhện", "lớp học", "trường học", "bài học",
-  "bài tập", "bài thi", "kỳ thi", "kỳ nghỉ", "năm học", "môn học",
-  "giờ học", "sách vở", "bút mực", "bảng đen", "phấn trắng", "cặp sách",
-  "đồng phục", "công việc", "việc làm", "nghề nghiệp", "tiền lương", "tiền bạc",
-  "kinh tế", "xã hội", "chính trị", "pháp luật", "quyền lợi", "nghĩa vụ",
-  "trách nhiệm", "quyết định", "kế hoạch", "dự án", "hợp đồng", "công ty",
-  "doanh nghiệp", "thị trường", "sản phẩm", "dịch vụ", "bữa ăn", "bữa sáng",
-  "bữa trưa", "bữa tối", "món ăn", "thức ăn", "đồ uống", "cơm trắng",
-  "bánh mì", "bánh kẹo", "trái cây", "rau xanh", "thịt heo", "thịt bò",
-  "thịt gà", "cá kho", "canh chua", "nước mắm", "đường cát", "muối tiêu",
-  "cái bàn", "cái ghế", "cái giường", "cái tủ", "cái cửa", "cửa sổ",
-  "mái nhà", "sân nhà", "chiếc xe", "xe máy", "xe đạp", "xe hơi",
-  "điện tử", "máy tính", "ti vi", "tủ lạnh", "máy giặt", "quạt máy",
-  "đèn điện", "tình yêu", "tình bạn", "tình cảm", "hạnh phúc", "đau khổ",
-  "niềm vui", "nỗi buồn", "hy vọng", "ước mơ", "tương lai", "quá khứ",
-  "hiện tại", "thời gian", "không gian", "cuộc sống", "cuộc đời", "số phận",
-  "may mắn", "thành công", "thất bại", "cái đầu", "khuôn mặt", "đôi mắt",
-  "cái mũi", "cái miệng", "đôi tai", "mái tóc", "đôi tay", "bàn tay",
-  "ngón tay", "đôi chân", "bàn chân", "trái tim", "lá gan", "buồng phổi",
-  "quốc gia", "văn hóa", "hóa học", "vật lý", "lý thuyết",
-];
-const noituWordSet = new Set(NOITU_WORDS.map((w) => w.toLowerCase()));
 
 const slashCommands = [
   new SlashCommandBuilder()
@@ -175,6 +142,15 @@ const slashCommands = [
         .setMinValue(1)
         .setMaxValue(MAX_MUTE_MINUTES),
     ),
+  new SlashCommandBuilder()
+    .setName("verifysetup")
+    .setDescription("Tạo/cập nhật kênh xác thực thành viên bằng nút bấm"),
+  new SlashCommandBuilder()
+    .setName("anti-external")
+    .setDescription("Tắt quyền 'Dùng ứng dụng mở rộng' của @everyone trên tất cả kênh (giữ nguyên các quyền khác)"),
+  new SlashCommandBuilder()
+    .setName("backupnow")
+    .setDescription("Sao lưu ngay các cấu hình đã lưu (config/antinuke/honeypot/verify) lên kênh backup riêng"),
 ].map((cmd) => cmd.toJSON());
 
 // ── Đăng ký lệnh RIÊNG CHO TỪNG SERVER thay vì đăng ký global ───────────
@@ -192,8 +168,21 @@ async function registerCommandsForGuild(rest, guild) {
 client.on("clientReady", async (readyClient) => {
   console.log(`Bot online: ${readyClient.user.tag}`);
   const rest = new REST().setToken(token);
+
+  // Xoá lệnh GLOBAL cũ nếu có — bot chỉ dùng lệnh theo từng server, còn lệnh
+  // global sót lại từ trước sẽ khiến Discord hiện TRÙNG lệnh trong danh sách.
+  await rest
+    .put(Routes.applicationCommands(readyClient.user.id), { body: [] })
+    .catch((err) => console.error("Xoá lệnh global cũ lỗi:", err.message));
+
   for (const guild of readyClient.guilds.cache.values()) {
     await registerCommandsForGuild(rest, guild);
+
+    // saved-configs.json không còn → dấu hiệu Termux vừa bị xoá/cài lại.
+    // Tự tải bản backup gần nhất trong #wxz-backup về để khôi phục.
+    if (!fs.existsSync(CONFIG_FILE)) {
+      await restoreConfigsFromDiscord(guild);
+    }
   }
 });
 
@@ -491,6 +480,145 @@ function buildHoneypotEmbed(trapCount, action, muteMinutes) {
     .setTimestamp();
 }
 
+async function createOrUpdateVerifyChannel(guild) {
+  const allChannels = await guild.channels.fetch();
+  let channel = allChannels.find((c) => c.name === VERIFY_CHANNEL_NAME);
+
+  if (!channel) {
+    channel = await guild.channels.create({
+      name: VERIFY_CHANNEL_NAME,
+      type: ChannelType.GuildText,
+      reason: "Thiết lập kênh xác thực thành viên",
+    });
+  }
+
+  // Không cần gõ chữ hay thả reaction — chỉ bấm nút, nên khoá luôn 2 quyền này
+  await channel.permissionOverwrites
+    .edit(guild.roles.everyone, { ViewChannel: true, SendMessages: false, AddReactions: false })
+    .catch(() => {});
+
+  let role = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
+  if (!role) {
+    role = await guild.roles.create({ name: VERIFY_ROLE_NAME, reason: "Tự tạo role verify" });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle("🛡️ XÁC THỰC THÀNH VIÊN")
+    .setDescription(
+      `Bấm nút bên dưới để xác thực và nhận role **${VERIFY_ROLE_NAME}**, mở khoá toàn bộ server.`,
+    )
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("verify_button")
+      .setLabel("VERIFY NOW")
+      .setEmoji("🛡️")
+      .setStyle(ButtonStyle.Success),
+  );
+
+  const state = loadState();
+  let infoMessage = state.messageId
+    ? await channel.messages.fetch(state.messageId).catch(() => null)
+    : null;
+  if (infoMessage) {
+    await infoMessage.edit({ embeds: [embed], components: [row] }).catch(() => {});
+  } else {
+    infoMessage = await channel.send({ embeds: [embed], components: [row] });
+  }
+
+  saveState({ channelId: channel.id, messageId: infoMessage.id, roleId: role.id });
+
+  return { channel, message: infoMessage, role };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Backup / khôi phục: Termux có thể bị xoá nhầm bất cứ lúc nào, mà 4 file
+// JSON (saved-configs, antinuke-state, honeypot-state, verify-state) chỉ
+// nằm trên máy đó. Nên mỗi lần dữ liệu quan trọng thay đổi, bot gửi kèm
+// 4 file này lên 1 kênh ẩn (#wxz-backup) — dữ liệu nằm trên Discord thì
+// mất Termux cũng không sao. Lúc bot khởi động lại mà thấy saved-configs.json
+// không còn (dấu hiệu Termux vừa bị xoá/cài lại), bot tự tải bản backup
+// gần nhất về để khôi phục, không cần làm gì thêm.
+// ─────────────────────────────────────────────────────────────────────────
+async function ensureBackupChannel(guild) {
+  const existing = guild.channels.cache.find((c) => c.name === BACKUP_CHANNEL_NAME);
+  if (existing) return existing;
+  return guild.channels.create({
+    name: BACKUP_CHANNEL_NAME,
+    type: ChannelType.GuildText,
+    reason: "Kênh lưu backup cấu hình bot",
+    permissionOverwrites: [{ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] }],
+  });
+}
+
+const BACKUP_FILE_MAP = {
+  "saved-configs.json": CONFIG_FILE,
+  "antinuke-state.json": ANTINUKE_FILE,
+  "honeypot-state.json": HONEYPOT_FILE,
+  "verify-state.json": STATE_FILE,
+};
+
+async function backupAllToDiscord(guild) {
+  const channel = await ensureBackupChannel(guild);
+  const files = Object.entries(BACKUP_FILE_MAP)
+    .filter(([, filePath]) => fs.existsSync(filePath))
+    .map(([name, filePath]) => new AttachmentBuilder(filePath, { name }));
+  if (files.length === 0) return null;
+  return channel.send({
+    content: `🗄️ Backup cấu hình — ${new Date().toLocaleString("vi-VN")}`,
+    files,
+  });
+}
+
+async function restoreConfigsFromDiscord(guild) {
+  try {
+    const allChannels = await guild.channels.fetch();
+    const channel = allChannels.find((c) => c.name === BACKUP_CHANNEL_NAME);
+    if (!channel) return false;
+
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const latest = [...messages.values()]
+      .filter((m) => m.attachments.size > 0)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp)[0];
+    if (!latest) return false;
+
+    for (const att of latest.attachments.values()) {
+      const destPath = BACKUP_FILE_MAP[att.name];
+      if (!destPath) continue;
+      const res = await fetch(att.url);
+      const text = await res.text();
+      fs.writeFileSync(destPath, text);
+    }
+    console.log(`Đã khôi phục cấu hình từ #${BACKUP_CHANNEL_NAME} (backup lúc ${latest.createdAt.toISOString()}).`);
+    return true;
+  } catch (err) {
+    console.error("Khôi phục cấu hình từ Discord lỗi:", err.message);
+    return false;
+  }
+}
+
+async function disableExternalAppsEveryone(guild) {
+  const result = { updated: 0, errors: [] };
+  const channels = await guild.channels.fetch();
+  const everyone = guild.roles.everyone;
+
+  for (const channel of channels.values()) {
+    if (!channel || channel.isThread?.()) continue;
+    try {
+      // .edit() chỉ đụng đúng 1 quyền này — mọi allow/deny khác trên kênh giữ nguyên
+      await channel.permissionOverwrites.edit(everyone, { UseExternalApps: false });
+      result.updated++;
+    } catch (err) {
+      result.errors.push(`"${channel.name}": ${err.message}`);
+    }
+    await sleep(OP_DELAY_MS);
+  }
+
+  return result;
+}
+
 async function createOrUpdateHoneypotChannel(guild, action, muteMinutes) {
   let honeypot = loadHoneypot() ?? {};
   const allChannels = await guild.channels.fetch();
@@ -599,36 +727,6 @@ client.on("messageCreate", async (message) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// messageReactionAdd: xác thực thành viên khi thả reaction ✅ trong #verify
-// ─────────────────────────────────────────────────────────────────────────
-client.on("messageReactionAdd", async (reaction, user) => {
-  try {
-    if (user.bot) return;
-    if (reaction.partial) await reaction.fetch();
-    if (user.partial) await user.fetch();
-
-    const { message } = reaction;
-    const guild = message.guild;
-    if (!guild) return;
-    if (message.channel.name !== VERIFY_CHANNEL_NAME) return;
-    if (reaction.emoji.name !== VERIFY_EMOJI) return;
-
-    const member = await guild.members.fetch(user.id).catch(() => null);
-    if (!member) return;
-
-    let role = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
-    if (!role) {
-      role = await guild.roles.create({ name: VERIFY_ROLE_NAME, reason: "Tự tạo role verify" });
-    }
-    if (!member.roles.cache.has(role.id)) {
-      await member.roles.add(role, "Xác thực qua reaction ✅");
-    }
-  } catch (err) {
-    console.error("Xử lý reaction verify lỗi:", err.message);
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────
 // channelDelete: bẫy chống nuke — phát hiện ai xoá kênh log #wxz-log
 // (bot cần quyền "View Audit Log" để tra ra người xoá)
 // ─────────────────────────────────────────────────────────────────────────
@@ -691,9 +789,33 @@ client.on("channelDelete", async (channel) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// interactionCreate: xử lý 4 slash command (chỉ cho Administrator dùng)
+// interactionCreate: nút bấm verify + 7 slash command (chỉ Administrator)
 // ─────────────────────────────────────────────────────────────────────────
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isButton()) {
+    if (interaction.customId !== "verify_button") return;
+    const { guild, member } = interaction;
+    if (!guild || !member) return;
+
+    try {
+      const state = loadState();
+      let role = state.roleId ? await guild.roles.fetch(state.roleId).catch(() => null) : null;
+      if (!role) role = guild.roles.cache.find((r) => r.name === VERIFY_ROLE_NAME);
+      if (!role) role = await guild.roles.create({ name: VERIFY_ROLE_NAME, reason: "Tự tạo role verify" });
+
+      if (member.roles.cache.has(role.id)) {
+        await interaction.reply({ content: "Bạn đã xác thực rồi.", ephemeral: true });
+        return;
+      }
+      await member.roles.add(role, "Xác thực qua nút bấm");
+      await interaction.reply({ content: "✅ Xác thực thành công! Chúc bạn vui vẻ.", ephemeral: true });
+    } catch (err) {
+      console.error("Xử lý verify button lỗi:", err.message);
+      await interaction.reply({ content: "Có lỗi xảy ra, thử lại sau.", ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   const { guild, member, commandName } = interaction;
   if (!guild || !member) {
@@ -715,6 +837,7 @@ client.on("interactionCreate", async (interaction) => {
       const configs = loadConfigs();
       configs[ten] = config;
       saveConfigs(configs);
+      await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
       await interaction.editReply(`Đã lưu cấu hình server với tên **${ten}**.`);
       return;
     }
@@ -753,6 +876,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
       await createAntinukeLogChannel(guild);
       saveAntinuke({ action: hanhdong, config: configName, muteMinutes: thoigian });
+      await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
       await interaction.editReply(
         `Đã bật chống nuke. Nếu #${ANTINUKE_LOG_CHANNEL_NAME} bị xoá, kẻ xoá sẽ bị **${hanhdong}** ` +
           `và server sẽ tự khôi phục theo cấu hình **${configName}**.`,
@@ -766,7 +890,42 @@ client.on("interactionCreate", async (interaction) => {
 
       await interaction.deferReply();
       await createOrUpdateHoneypotChannel(guild, hanhdong, thoigian);
+      await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
       await interaction.editReply(`Đã thiết lập kênh honeypot. Ai nhắn vào đó sẽ bị **${hanhdong}**.`);
+      return;
+    }
+
+    if (commandName === "verifysetup") {
+      await interaction.deferReply();
+      await createOrUpdateVerifyChannel(guild);
+      await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
+      await interaction.editReply(
+        `Đã thiết lập kênh xác thực. Ai bấm nút **VERIFY NOW** sẽ nhận role **${VERIFY_ROLE_NAME}**.`,
+      );
+      return;
+    }
+
+    if (commandName === "anti-external") {
+      await interaction.deferReply();
+      const result = await disableExternalAppsEveryone(guild);
+      await interaction.editReply(
+        `Đã tắt quyền "Dùng ứng dụng mở rộng" cho @everyone ở ${result.updated} kênh` +
+          (result.errors.length ? `, ${result.errors.length} kênh lỗi (xem console).` : "."),
+      );
+      return;
+    }
+
+    if (commandName === "backupnow") {
+      await interaction.deferReply();
+      const sent = await backupAllToDiscord(guild).catch((err) => {
+        console.error("Backup thủ công lỗi:", err.message);
+        return null;
+      });
+      await interaction.editReply(
+        sent
+          ? `Đã sao lưu cấu hình lên #${BACKUP_CHANNEL_NAME}.`
+          : `Chưa có gì để sao lưu, hoặc backup thất bại (xem console).`,
+      );
       return;
     }
   } catch (err) {
