@@ -17,6 +17,7 @@ import {
 import { fileURLToPath } from "url";
 import path from "path";
 import fs from "fs";
+import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "verify-state.json");
