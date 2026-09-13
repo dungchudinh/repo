@@ -17,7 +17,6 @@ import {
 import { fileURLToPath } from "url";
 import path from "path";
 import fs from "fs";
-import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "verify-state.json");
@@ -152,6 +151,12 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName("backupnow")
     .setDescription("Sao lưu ngay các cấu hình đã lưu (config/antinuke/honeypot/verify) lên kênh backup riêng"),
+  new SlashCommandBuilder()
+    .setName("showconfig")
+    .setDescription("Xem danh sách cấu hình đã lưu, hoặc xem chi tiết danh mục/kênh của 1 cấu hình")
+    .addStringOption((opt) =>
+      opt.setName("ten").setDescription("Tên cấu hình muốn xem chi tiết (bỏ trống để xem danh sách)").setRequired(false),
+    ),
 ].map((cmd) => cmd.toJSON());
 
 // ── Đăng ký lệnh RIÊNG CHO TỪNG SERVER thay vì đăng ký global ───────────
@@ -487,6 +492,43 @@ async function sendModerationLog(channel, { user, action, reason, muteMinutes })
   await channel.send({ embeds: [embed] });
 }
 
+function buildAntinukeAlertEmbed({ user, action, muteMinutes, configName, restoreLog, verifyRestored, honeypotRestored }) {
+  const actionLabel =
+    action === "ban" ? "BAN" : action === "mute" ? `MUTE (${formatMuteDuration(muteMinutes)})` : "KICK";
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe74c3c)
+    .setTitle("🛡️ PHÁT HIỆN NUKE — ĐÃ XỬ LÝ")
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .addFields(
+      { name: "Kẻ tấn công", value: `${user.tag ?? user.username}\n${user.id}` },
+      { name: "Đã xử lý", value: actionLabel, inline: true },
+      { name: "Cấu hình khôi phục", value: configName, inline: true },
+    );
+
+  if (restoreLog) {
+    embed.addFields({
+      name: "Đồng bộ lại kênh",
+      value:
+        `Giữ nguyên: ${restoreLog.kept} · Đã xoá: ${restoreLog.deleted} · Đã tạo: ${restoreLog.created}` +
+        (restoreLog.errors.length ? `\n⚠️ ${restoreLog.errors.length} lỗi — xem console` : ""),
+    });
+  } else {
+    embed.addFields({ name: "Đồng bộ lại kênh", value: "Không có bản cấu hình để khôi phục" });
+  }
+
+  const rebuilt = [];
+  if (verifyRestored) rebuilt.push("verify");
+  if (honeypotRestored) rebuilt.push("honeypot");
+  embed.addFields({
+    name: "Kênh hệ thống tái lập",
+    value: rebuilt.length ? rebuilt.join(", ") : "Không có kênh nào cần tái lập",
+  });
+
+  embed.setTimestamp();
+  return embed;
+}
+
 function buildHoneypotEmbed(trapCount, action, muteMinutes) {
   const actionLabel =
     action === "ban" ? "BAN" : action === "mute" ? `MUTE (${formatMuteDuration(muteMinutes)})` : "KICK";
@@ -582,11 +624,10 @@ const BACKUP_FILE_MAP = {
 };
 
 async function backupAllToDiscord(guild) {
+  const filesToBackup = Object.entries(BACKUP_FILE_MAP).filter(([, filePath]) => fs.existsSync(filePath));
+  if (filesToBackup.length === 0) return null; // Chưa có gì để lưu thì không tạo kênh backup làm gì
   const channel = await ensureBackupChannel(guild);
-  const files = Object.entries(BACKUP_FILE_MAP)
-    .filter(([, filePath]) => fs.existsSync(filePath))
-    .map(([name, filePath]) => new AttachmentBuilder(filePath, { name }));
-  if (files.length === 0) return null;
+  const files = filesToBackup.map(([name, filePath]) => new AttachmentBuilder(filePath, { name }));
   return channel.send({
     content: `🗄️ Backup cấu hình — ${new Date().toLocaleString("vi-VN")}`,
     files,
@@ -761,13 +802,22 @@ client.on("channelDelete", async (channel) => {
   const antinuke = loadAntinuke();
   if (!antinuke) return;
 
+  // Nuke thật thường xoá NHIỀU kênh gần như cùng lúc, không riêng gì kênh log.
+  // limit:5 cũ dễ bị các lượt xoá khác "đẩy" mất đúng dòng mình cần tìm khỏi
+  // cửa sổ audit log — đây nhiều khả năng là lý do lần thử thứ 2 trở đi bị im
+  // lặng bỏ qua. Giờ dò cửa sổ rộng hơn (20) và thử lại vài lần vì audit log
+  // của Discord đôi khi ghi trễ hơn sự kiện channelDelete vài trăm ms.
   let executor = null;
-  try {
-    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 5 });
-    const entry = auditLogs.entries.find((e) => e.target?.id === channel.id);
-    executor = entry?.executor ?? null;
-  } catch (err) {
-    console.error("Đọc audit log lỗi (bot cần quyền 'View Audit Log'):", err.message);
+  for (let attempt = 0; attempt < 3 && !executor; attempt++) {
+    if (attempt > 0) await sleep(500);
+    try {
+      const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 20 });
+      const entry = auditLogs.entries.find((e) => e.target?.id === channel.id);
+      if (entry) executor = entry.executor ?? null;
+    } catch (err) {
+      console.error("Đọc audit log lỗi (bot cần quyền 'View Audit Log'):", err.message);
+      break; // lỗi quyền/API thì thử lại cũng vô ích
+    }
   }
   if (!executor || executor.id === client.user.id) return;
 
@@ -797,21 +847,62 @@ client.on("channelDelete", async (channel) => {
   }
 
   const newLogChannel = await createAntinukeLogChannel(guild).catch(() => null);
-  if (newLogChannel) {
-    await sendModerationLog(newLogChannel, { user: executor, action, reason, muteMinutes }).catch(() => {});
-  }
 
   const configs = loadConfigs();
   const savedConfig = configs[configName];
-  if (savedConfig) {
-    await restoreGuildConfig(guild, savedConfig).catch((err) =>
-      console.error("Khôi phục cấu hình sau nuke lỗi:", err.message),
-    );
+  const restoreLog = savedConfig
+    ? await restoreGuildConfig(guild, savedConfig).catch((err) => {
+        console.error("Khôi phục cấu hình sau nuke lỗi:", err.message);
+        return null;
+      })
+    : null;
+
+  // Nuke thường xoá LUÔN cả #verify, #honeypot, #wxz-backup chứ không riêng
+  // gì #wxz-log — nhưng restoreGuildConfig cố tình bỏ qua 3 kênh này (chúng
+  // là kênh hệ thống, không nằm trong cấu hình đã lưu). Nên ở đây tái lập
+  // riêng: kênh nào TRƯỚC ĐÓ đã từng /verifysetup hay /honeypotsetup thì
+  // tạo lại y nguyên cài đặt cũ; chưa từng dùng lệnh đó thì thôi, không tự
+  // tạo ra kênh mới không ai cần.
+  const [verifyRestored, honeypotRestored] = await Promise.all([
+    (async () => {
+      const verifyState = loadState();
+      if (!verifyState.channelId) return false; // chưa từng /verifysetup
+      await createOrUpdateVerifyChannel(guild).catch((err) =>
+        console.error("Tái lập kênh verify sau nuke lỗi:", err.message),
+      );
+      return true;
+    })(),
+    (async () => {
+      const honeypot = loadHoneypot();
+      if (!honeypot) return false; // chưa từng /honeypotsetup
+      await createOrUpdateHoneypotChannel(guild, honeypot.action, honeypot.muteMinutes).catch((err) =>
+        console.error("Tái lập kênh honeypot sau nuke lỗi:", err.message),
+      );
+      return true;
+    })(),
+  ]);
+
+  // backupAllToDiscord tự bỏ qua nếu chưa có file nào để lưu, nên gọi thẳng
+  // ở đây là an toàn — vừa tái tạo #wxz-backup nếu đã từng dùng, vừa lưu
+  // luôn bản mới nhất (kể cả channelId/messageId vừa đổi ở bước trên).
+  await backupAllToDiscord(guild).catch((err) => console.error("Backup sau nuke lỗi:", err.message));
+
+  if (newLogChannel) {
+    const embed = buildAntinukeAlertEmbed({
+      user: executor,
+      action,
+      muteMinutes,
+      configName,
+      restoreLog,
+      verifyRestored,
+      honeypotRestored,
+    });
+    await newLogChannel.send({ embeds: [embed] }).catch(() => {});
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// interactionCreate: nút bấm verify + 7 slash command (chỉ Administrator)
+// interactionCreate: nút bấm verify + 8 slash command (chỉ Administrator)
 // ─────────────────────────────────────────────────────────────────────────
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isButton()) {
@@ -860,7 +951,95 @@ client.on("interactionCreate", async (interaction) => {
       configs[ten] = config;
       saveConfigs(configs);
       await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
-      await interaction.editReply(`Đã lưu cấu hình server với tên **${ten}**.`);
+
+      const savedEmbed = new EmbedBuilder()
+        .setColor(0x2ecc71)
+        .setTitle("💾 Đã lưu cấu hình")
+        .addFields(
+          { name: "Tên", value: ten, inline: true },
+          { name: "Số danh mục", value: `${config.categories.length}`, inline: true },
+          { name: "Số kênh", value: `${config.channels.length}`, inline: true },
+        )
+        .setFooter({ text: "Dùng /showconfig để xem lại, /setconfig để khôi phục" })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [savedEmbed] });
+      return;
+    }
+
+    if (commandName === "showconfig") {
+      const ten = interaction.options.getString("ten");
+      const configs = loadConfigs();
+      const names = Object.keys(configs);
+      await interaction.deferReply();
+
+      if (!ten) {
+        const listEmbed = new EmbedBuilder().setColor(0x3498db).setTitle("📋 Danh sách cấu hình đã lưu");
+        if (names.length === 0) {
+          listEmbed.setDescription("Chưa có cấu hình nào. Dùng /saveconfig để lưu cấu hình hiện tại.");
+        } else {
+          listEmbed
+            .setDescription(
+              names
+                .map((name) => {
+                  const cfg = configs[name];
+                  const savedAt = cfg.savedAt ? new Date(cfg.savedAt).toLocaleString("vi-VN") : "?";
+                  return `**${name}** — ${cfg.categories.length} danh mục, ${cfg.channels.length} kênh (lưu lúc ${savedAt})`;
+                })
+                .join("\n"),
+            )
+            .setFooter({ text: "Dùng /showconfig ten:<tên> để xem chi tiết từng kênh" });
+        }
+        await interaction.editReply({ embeds: [listEmbed] });
+        return;
+      }
+
+      const config = configs[ten];
+      if (!config) {
+        await interaction.editReply(`Không tìm thấy bản lưu tên **${ten}**.`);
+        return;
+      }
+
+      // Gom kênh theo danh mục để vẽ dạng cây giống hệt cấu trúc server
+      const channelsByParent = new Map();
+      const noParent = [];
+      for (const ch of config.channels) {
+        if (!ch.parentName) {
+          noParent.push(ch);
+          continue;
+        }
+        if (!channelsByParent.has(ch.parentName)) channelsByParent.set(ch.parentName, []);
+        channelsByParent.get(ch.parentName).push(ch);
+      }
+
+      const lines = [];
+      for (const cat of config.categories) {
+        lines.push(`    ${cat.name}`);
+        for (const ch of channelsByParent.get(cat.name) ?? []) lines.push(`#${ch.name}`);
+        channelsByParent.delete(cat.name);
+      }
+      for (const [parentName, children] of channelsByParent) {
+        lines.push(`    ${parentName}`);
+        for (const ch of children) lines.push(`#${ch.name}`);
+      }
+      if (noParent.length) {
+        lines.push(`    (không danh mục)`);
+        for (const ch of noParent) lines.push(`#${ch.name}`);
+      }
+
+      let tree = lines.join("\n") || "(trống)";
+      if (tree.length > 3800) tree = `${tree.slice(0, 3800)}\n... (còn nữa)`;
+
+      const savedAt = config.savedAt ? new Date(config.savedAt).toLocaleString("vi-VN") : "?";
+      const detailEmbed = new EmbedBuilder()
+        .setColor(0x3498db)
+        .setTitle(`📋 Cấu hình: ${ten}`)
+        .setDescription(`\`\`\`\n${tree}\n\`\`\``)
+        .addFields(
+          { name: "Số danh mục", value: `${config.categories.length}`, inline: true },
+          { name: "Số kênh", value: `${config.channels.length}`, inline: true },
+        )
+        .setFooter({ text: `Lưu lúc ${savedAt}` });
+      await interaction.editReply({ embeds: [detailEmbed] });
       return;
     }
 
@@ -874,10 +1053,21 @@ client.on("interactionCreate", async (interaction) => {
       }
       await interaction.deferReply();
       const log = await restoreGuildConfig(guild, config);
-      await interaction.editReply(
-        `Đồng bộ xong: giữ ${log.kept}, xoá ${log.deleted}, tạo mới ${log.created}` +
-          (log.errors.length ? `, ${log.errors.length} lỗi (xem console).` : "."),
-      );
+
+      const syncEmbed = new EmbedBuilder()
+        .setColor(log.errors.length ? 0xe67e22 : 0x2ecc71)
+        .setTitle("🔄 Đã đồng bộ cấu hình")
+        .addFields(
+          { name: "Cấu hình", value: ten, inline: true },
+          { name: "Giữ nguyên", value: `${log.kept}`, inline: true },
+          { name: "Đã xoá", value: `${log.deleted}`, inline: true },
+          { name: "Đã tạo", value: `${log.created}`, inline: true },
+        );
+      if (log.errors.length) {
+        syncEmbed.addFields({ name: `⚠️ ${log.errors.length} lỗi`, value: "Xem console để biết chi tiết" });
+      }
+      syncEmbed.setTimestamp();
+      await interaction.editReply({ embeds: [syncEmbed] });
       return;
     }
 
@@ -899,10 +1089,22 @@ client.on("interactionCreate", async (interaction) => {
       await createAntinukeLogChannel(guild);
       saveAntinuke({ action: hanhdong, config: configName, muteMinutes: thoigian });
       await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
-      await interaction.editReply(
-        `Đã bật chống nuke. Nếu #${ANTINUKE_LOG_CHANNEL_NAME} bị xoá, kẻ xoá sẽ bị **${hanhdong}** ` +
-          `và server sẽ tự khôi phục theo cấu hình **${configName}**.`,
-      );
+
+      const setupEmbed = new EmbedBuilder()
+        .setColor(0x2ecc71)
+        .setTitle("🛡️ Đã bật chống nuke")
+        .setDescription(`Xoá kênh #${ANTINUKE_LOG_CHANNEL_NAME} sẽ bị coi là nuke và bị xử lý ngay.`)
+        .addFields(
+          { name: "Kênh giám sát", value: `#${ANTINUKE_LOG_CHANNEL_NAME}`, inline: true },
+          { name: "Hành động với kẻ xoá", value: hanhdong.toUpperCase(), inline: true },
+          { name: "Cấu hình khôi phục", value: configName, inline: true },
+        );
+      if (hanhdong === "mute") {
+        setupEmbed.addFields({ name: "Thời gian mute", value: formatMuteDuration(thoigian), inline: true });
+      }
+      setupEmbed.setTimestamp();
+
+      await interaction.editReply({ embeds: [setupEmbed] });
       return;
     }
 
@@ -913,7 +1115,19 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
       await createOrUpdateHoneypotChannel(guild, hanhdong, thoigian);
       await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
-      await interaction.editReply(`Đã thiết lập kênh honeypot. Ai nhắn vào đó sẽ bị **${hanhdong}**.`);
+
+      const honeypotEmbed = new EmbedBuilder()
+        .setColor(0x2ecc71)
+        .setTitle("🍯 Đã thiết lập honeypot")
+        .addFields(
+          { name: "Kênh bẫy", value: `#${HONEYPOT_CHANNEL_NAME}`, inline: true },
+          { name: "Hành động", value: hanhdong.toUpperCase(), inline: true },
+        );
+      if (hanhdong === "mute") {
+        honeypotEmbed.addFields({ name: "Thời gian mute", value: formatMuteDuration(thoigian), inline: true });
+      }
+      honeypotEmbed.setTimestamp();
+      await interaction.editReply({ embeds: [honeypotEmbed] });
       return;
     }
 
@@ -921,19 +1135,36 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
       await createOrUpdateVerifyChannel(guild);
       await backupAllToDiscord(guild).catch((err) => console.error("Backup lỗi:", err.message));
-      await interaction.editReply(
-        `Đã thiết lập kênh xác thực. Ai bấm nút **VERIFY NOW** sẽ nhận role **${VERIFY_ROLE_NAME}**.`,
-      );
+
+      const verifyEmbed = new EmbedBuilder()
+        .setColor(0x2ecc71)
+        .setTitle("✅ Đã thiết lập xác thực")
+        .addFields(
+          { name: "Kênh", value: `#${VERIFY_CHANNEL_NAME}`, inline: true },
+          { name: "Role khi xác thực", value: VERIFY_ROLE_NAME, inline: true },
+          { name: "Cách xác thực", value: "Bấm nút VERIFY NOW", inline: true },
+        )
+        .setTimestamp();
+      await interaction.editReply({ embeds: [verifyEmbed] });
       return;
     }
 
     if (commandName === "anti-external") {
       await interaction.deferReply();
       const result = await disableExternalAppsEveryone(guild);
-      await interaction.editReply(
-        `Đã tắt quyền "Dùng ứng dụng mở rộng" cho @everyone ở ${result.updated} kênh` +
-          (result.errors.length ? `, ${result.errors.length} kênh lỗi (xem console).` : "."),
-      );
+
+      const externalEmbed = new EmbedBuilder()
+        .setColor(result.errors.length ? 0xe67e22 : 0x2ecc71)
+        .setTitle("🔒 Đã tắt Dùng ứng dụng mở rộng")
+        .addFields(
+          { name: "Kênh đã áp dụng", value: `${result.updated}`, inline: true },
+          { name: "Phạm vi", value: "@everyone, mọi kênh", inline: true },
+        );
+      if (result.errors.length) {
+        externalEmbed.addFields({ name: `⚠️ ${result.errors.length} kênh lỗi`, value: "Xem console để biết chi tiết" });
+      }
+      externalEmbed.setTimestamp();
+      await interaction.editReply({ embeds: [externalEmbed] });
       return;
     }
 
@@ -943,11 +1174,17 @@ client.on("interactionCreate", async (interaction) => {
         console.error("Backup thủ công lỗi:", err.message);
         return null;
       });
-      await interaction.editReply(
-        sent
-          ? `Đã sao lưu cấu hình lên #${BACKUP_CHANNEL_NAME}.`
-          : `Chưa có gì để sao lưu, hoặc backup thất bại (xem console).`,
-      );
+
+      const backupEmbed = new EmbedBuilder()
+        .setColor(sent ? 0x2ecc71 : 0xe67e22)
+        .setTitle(sent ? "🗄️ Đã sao lưu" : "🗄️ Không có gì để sao lưu")
+        .setDescription(
+          sent
+            ? `Đã gửi bản sao lưu mới nhất vào #${BACKUP_CHANNEL_NAME}.`
+            : "Chưa có config/antinuke/honeypot/verify nào được thiết lập, hoặc backup thất bại (xem console).",
+        )
+        .setTimestamp();
+      await interaction.editReply({ embeds: [backupEmbed] });
       return;
     }
   } catch (err) {
